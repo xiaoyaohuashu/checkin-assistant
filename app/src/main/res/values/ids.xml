@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  v13: 三个一级页面改用 ViewPager2 承载后，需要**稳定**的 view id。
+
+  原来的 fragmentContainer 用 View.generateViewId() 动态生成——配置变更（旋转/分屏）或
+  进程恢复后 Activity 重建，会生成一个新的随机 id，FragmentManager 恢复出来的 Fragment
+  就找不到自己的容器，于是被静默丢弃、又新建一个。改成资源 id 后 id 跨重建不变，
+  ViewPager2 的 currentItem 与两个 Fragment 都能正确恢复。
+-->
+<resources>
+    <!-- 承载三个一级页面的 ViewPager2 -->
+    <item name="page_pager" type="id" />
+    <!-- 第 1 页：HistoryFragment 的容器 -->
+    <item name="page_history" type="id" />
+    <!-- 第 2 页：SettingsFragment 的容器 -->
+    <item name="page_settings" type="id" />
+</resources>

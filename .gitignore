@@ -1,0 +1,21 @@
+# Gradle build and local cache files
+.gradle/
+build/
+**/build/
+
+# Android Studio / IntelliJ local settings
+.idea/
+*.iml
+local.properties
+
+# Android packages and generated native files
+*.apk
+*.aab
+.externalNativeBuild/
+.cxx/
+
+# Operating-system files
+.DS_Store
+
+# AtomCode local-scope configs (machine-specific)
+.atomcode/local/

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <cache-path name="shared_logs" path="shared_logs/" />
+    <!-- v6: SettingsActivity 导出数据备份的分享目录 -->
+    <external-files-path name="backup" path="backup/" />
+</paths>

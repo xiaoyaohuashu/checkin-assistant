@@ -1,0 +1,29 @@
+<resources>
+    <!-- v8：对齐 Web 原型配色 —— primary #3271EE / 页面底 #EEF6FF；
+         状态栏透明（顶部插画延伸至其下方，图标浅色），导航栏白底深色图标。 -->
+    <style name="Theme.CheckInAssistant" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#3271EE</item>
+        <item name="colorAccent">#3271EE</item>
+        <item name="android:navigationBarColor">#FFFFFF</item>
+        <!-- 主题层保留品牌蓝状态栏（供权限自检 / 调试日志 / 地图选点等页面使用）；
+             首页在运行时改为透明并开启沉浸式，让顶部插画延伸至状态栏下方。 -->
+        <item name="android:statusBarColor">#2F6BF3</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowBackground">#EEF6FF</item>
+    </style>
+
+    <!-- v11：提醒点编辑对话框专用主题（仅 MainActivity.showEditor 使用，其余对话框不受影响）。
+         默认的 Dialog 主题是 windowIsFloating=true 的浮动窗口，generateLayout() 会按
+         dialogMinWidth 把窗口收窄，且系统 dialog 的 9-patch 背景自带左右内缩，于是首帧
+         呈现为「比屏幕窄 + 左右留白」的画面，要等 setOnShowListener 里 setLayout(-1,-1)
+         才撑满——这就是「进入编辑页先留白、内容再向左跳一下」的来源。
+         这里把窗口直接定义为非浮动 + 最小宽度 100%，第一帧就是全屏，不再需要事后纠正。 -->
+    <style name="Theme.CheckInAssistant.FullScreenDialog" parent="Theme.AppCompat.Light.Dialog.Alert">
+        <item name="android:windowIsFloating">false</item>
+        <item name="android:windowMinWidthMajor">100%</item>
+        <item name="android:windowMinWidthMinor">100%</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+    </style>
+</resources>
