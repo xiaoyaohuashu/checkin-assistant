@@ -20,6 +20,8 @@
 
 ## 自己编译
 
+本项目不提供编译好的安装包，需要使用自己的 Google Maps API Key 自行编译。
+
 1. 在 [Google Cloud Console](https://console.cloud.google.com/) 申请一个 Maps SDK for Android 的 API Key
 2. 在项目根目录创建 `local.properties`，写入：
 用 Android Studio 打开项目时会自动补上 `sdk.dir`；用命令行编译需要自己加上 `sdk.dir=你的Android SDK路径`
