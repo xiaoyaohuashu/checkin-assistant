@@ -128,9 +128,13 @@ internal fun pollTickIntent(context: Context): PendingIntent = PendingIntent.get
 /**
  * 排下一轮轮询（v2.2.12）。优先 setAlarmClock（本项目已验证锁屏下准时）；
  * 没有「闹钟和提醒」权限或被系统拒绝时退化到 setAndAllowWhileIdle（可能被系统推后）。
+ * [backup] = true 表示这是每轮开始时排的保底闹钟（v2.2.13）；它和正常的下一轮共用同一个 PendingIntent，
+ * 所以本轮正常结束后再排一次就把它覆盖了。
  * @return true = 按闹钟类别排入。
  */
-internal fun schedulePollTick(context: Context, at: Long): Boolean {
+internal fun schedulePollTick(context: Context, at: Long, backup: Boolean = false): Boolean {
+    // 先落盘「排着的是不是保底闹钟」再排：进程随后被杀，闹钟到的时候才认得出来。
+    PollWatchdog.markTickBackup(context, backup)
     val alarm = context.getSystemService(AlarmManager::class.java)
     val pendingIntent = pollTickIntent(context)
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarm.canScheduleExactAlarms()) {

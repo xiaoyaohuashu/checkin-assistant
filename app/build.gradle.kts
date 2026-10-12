@@ -30,8 +30,8 @@ android {
         applicationId = "com.checkinassistant"
         minSdk = 29
         targetSdk = 34
-        versionCode = 34
-        versionName = "2.2.12"
+        versionCode = 35
+        versionName = "2.2.13"
 
         manifestPlaceholders["GOOGLE_MAPS_API_KEY"] = loadMapsApiKey()
     }

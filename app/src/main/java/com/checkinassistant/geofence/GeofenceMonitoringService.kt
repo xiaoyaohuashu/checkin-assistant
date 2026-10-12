@@ -47,10 +47,13 @@ class GeofenceMonitoringService : Service() {
         createChannel()
         startForeground(FOREGROUND_ID, foregroundNotification())
         val tick = intent?.action == ACTION_POLL_TICK
+        // 到的是保底闹钟：上一轮没能走到「排下一轮」那一步（进程被杀，或那一轮超过了 90 秒）。
+        val backupFired = tick && PollWatchdog.tickIsBackup(this)
         if (tick && pollingJob?.isActive == true) {
             // 上一轮（或一次重新评估）还没结束：它结束时会自己排下一轮，这个闹钟不用再做事。
             releaseTickHandoff()
             DiagnosticRecordLogger.trace("POLL_TICK_SKIPPED：上一轮还没结束")
+            if (backupFired) scope.launch { logBackupAlarmFired("上一轮开始 ${POLL_BACKUP_MS / 1000}s 后仍未结束，本次不另起一轮") }
             return START_NOT_STICKY
         }
         if (!tick) pollingJob?.cancel()
@@ -59,9 +62,14 @@ class GeofenceMonitoringService : Service() {
             val lock = AlarmWakeLock.acquire(this@GeofenceMonitoringService, "GeofencePoll")
             releaseTickHandoff()
             try {
+                if (backupFired) {
+                    logBackupAlarmFired(if (pollActiveIds != null) "服务还在，直接跑下一轮" else "服务或进程重启过，重新评估")
+                }
                 if (tick && pollActiveIds != null) {
                     pollCycle(startId)
                 } else {
+                    // 这个闹钟已经用掉了；重新评估期间再被杀也要有闹钟接着（不该轮询时评估里会取消它）。
+                    if (tick) schedulePollTick(this@GeofenceMonitoringService, System.currentTimeMillis() + POLL_BACKUP_MS, backup = true)
                     DiagnosticRecordLogger.geofence(
                         this@GeofenceMonitoringService,
                         if (tick) "POLL_TICK_NO_STATE：收到轮询闹钟，但服务里没有轮询状态（服务或进程重启过，startId=$startId），重新评估生效时间段"
@@ -119,6 +127,9 @@ class GeofenceMonitoringService : Service() {
 
     /** 跑一轮轮询；还要继续轮询的话，结束时排下一轮闹钟。本轮出异常也照排，不让轮询因为一次异常断掉。 */
     private suspend fun pollCycle(startId: Int) {
+        // v2.2.13：先排保底闹钟。进程在本轮进行中被杀时，下面那次「排下一轮」不会执行，靠它把轮询接上；
+        // 本轮正常结束时下面用同一个 PendingIntent 再排一次，就把它覆盖了。
+        schedulePollTick(this, System.currentTimeMillis() + POLL_BACKUP_MS, backup = true)
         val keepPolling = try {
             pollCycleBody(startId)
         } catch (cancelled: CancellationException) {
@@ -134,10 +145,18 @@ class GeofenceMonitoringService : Service() {
             lastTickExact = exact
             DiagnosticRecordLogger.geofence(
                 this,
-                if (exact) "POLL_TICK_SCHEDULED：每轮结束后用 setAlarmClock 排下一轮（${POLL_INTERVAL_MS / 1000}s 后），每轮持锁上限 60s、结束即释放；此后各轮不再重复记这一条"
+                if (exact) "POLL_TICK_SCHEDULED：每轮开始先排 ${POLL_BACKUP_MS / 1000}s 保底闹钟，结束后用 setAlarmClock 排下一轮（${POLL_INTERVAL_MS / 1000}s 后）覆盖它，每轮持锁上限 60s、结束即释放；此后各轮不再重复记这一条"
                 else "POLL_TICK_INEXACT：没有「闹钟和提醒」权限或 setAlarmClock 被拒绝，下一轮退化为 setAndAllowWhileIdle，可能被系统推后"
             )
         }
+    }
+
+    private suspend fun logBackupAlarmFired(detail: String) {
+        DiagnosticRecordLogger.geofence(
+            this,
+            "POLL_BACKUP_ALARM_FIRED：保底闹钟触发（上一轮没有排上下一轮）；$detail；" +
+                "最后一次 POLL_CYCLE=${PollWatchdog.lastCycleAt(this)}，现在=${System.currentTimeMillis()}"
+        )
     }
 
     /** @return true = 继续轮询（调用方排下一轮）；false = 已停止轮询并安排好下一次时段唤醒。 */
@@ -332,6 +351,8 @@ class GeofenceMonitoringService : Service() {
         const val CHANNEL_ID = "geofence_monitoring"
         private const val FOREGROUND_ID = 301
         private const val POLL_INTERVAL_MS = 25_000L
+        /** 每轮开始时排的保底闹钟：比每轮持锁上限（60s）长，正常的一轮一定先结束并覆盖它。 */
+        private const val POLL_BACKUP_MS = 90_000L
         /** 轮询闹钟的广播交到服务手里之前持有的锁；服务这一轮拿到自己的锁后释放它。 */
         private val tickHandoff = java.util.concurrent.atomic.AtomicReference<PowerManager.WakeLock?>(null)
 

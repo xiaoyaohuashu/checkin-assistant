@@ -17,6 +17,7 @@ internal object PollWatchdog {
     private const val PREFERENCES_NAME = "poll_watchdog"
     private const val KEY_EXPECTED = "poll_expected"
     private const val KEY_LAST_CYCLE = "last_poll_cycle_at"
+    private const val KEY_TICK_BACKUP = "poll_tick_is_backup"
 
     /** 最后一轮 POLL_CYCLE 距今超过它就算轮询停了（正常周期 = 25s 间隔 + 最长 15s 定位）。 */
     const val STALE_MS = 60_000L
@@ -35,6 +36,13 @@ internal object PollWatchdog {
     fun markCycle(context: Context, at: Long) {
         prefs(context).edit().putLong(KEY_LAST_CYCLE, at).commit()
     }
+
+    /** 每次排轮询闹钟时调用：当前排着的是不是每轮开始时的保底闹钟（v2.2.13）。 */
+    fun markTickBackup(context: Context, backup: Boolean) {
+        prefs(context).edit().putBoolean(KEY_TICK_BACKUP, backup).commit()
+    }
+
+    fun tickIsBackup(context: Context): Boolean = prefs(context).getBoolean(KEY_TICK_BACKUP, false)
 
     fun expected(context: Context): Boolean = prefs(context).getBoolean(KEY_EXPECTED, false)
 
