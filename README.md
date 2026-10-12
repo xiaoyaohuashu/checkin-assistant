@@ -22,10 +22,22 @@
 
 本项目不提供编译好的安装包，需要使用自己的 Google Maps API Key 自行编译。
 
-1. 在 [Google Cloud Console](https://console.cloud.google.com/) 申请一个 Maps SDK for Android 的 API Key
+1. 在 [Google Cloud Console](https://console.cloud.google.com/) 申请一个 API Key，并为它启用 **Maps SDK for Android** 和 **Places API (New)**（地点搜索用的是新版 Places API，不启用搜索会失败）。建议把 Key 限制为 Android 应用：包名 `com.checkinassistant` + 你自己签名证书的 SHA-1。
 2. 在项目根目录创建 `local.properties`，写入：
-用 Android Studio 打开项目时会自动补上 `sdk.dir`；用命令行编译需要自己加上 `sdk.dir=你的Android SDK路径`
+
+   ```properties
+   MAPS_API_KEY=你的Key
+   ```
+
+   用 Android Studio 打开项目时会自动补上 `sdk.dir`；用命令行编译需要自己加上 `sdk.dir=你的Android SDK路径`
 3. 编译：
+
+   ```bash
+   ./gradlew assembleDebug
+   ```
+
+   生成的安装包在 `app/build/outputs/apk/debug/`。
+
 `local.properties` 已被 `.gitignore` 忽略，不会被提交。缺少 Key 时编译会直接报错并提示。
 
 ## 使用提示
