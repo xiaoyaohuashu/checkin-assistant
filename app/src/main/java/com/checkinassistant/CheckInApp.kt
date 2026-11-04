@@ -7,22 +7,31 @@ import android.os.Build
 import android.os.Process
 import android.os.SystemClock
 import com.checkinassistant.data.DiagnosticRecordLogger
+import com.checkinassistant.geofence.MonitorKeeper
 import com.checkinassistant.geofence.PollWatchdog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
  * 进程级诊断（v2.2.12）：每次进程启动记 PROCESS_START，并把系统记录的「上一次进程退出原因」
  * 记成 PROCESS_LAST_EXIT —— 用来回答「轮询静默停止时进程是不是被杀了、被谁杀的」。
  * 进程启动本身也是一次唤醒，顺带跑一次轮询看门狗。
+ *
+ * v2.2.14：进程启动时登记 WorkManager 兜底任务，并检查恢复前台服务和时段唤醒闹钟（[MonitorKeeper]）。
  */
 class CheckInApp : Application() {
     override fun onCreate() {
         super.onCreate()
         val startedWall = System.currentTimeMillis()
         val startedElapsed = SystemClock.elapsedRealtime()
+        val enqueueFailure = runCatching { MonitorKeeper.schedulePeriodicCheck(this) }.exceptionOrNull()
+        runCatching { com.checkinassistant.update.UpdateCheckWorker.schedule(this) }
         CoroutineScope(Dispatchers.IO).launch {
+            if (enqueueFailure != null) runCatching {
+                DiagnosticRecordLogger.geofence(this@CheckInApp, "KEEPER_WORK_ENQUEUE_FAILURE：${enqueueFailure.javaClass.simpleName}: ${enqueueFailure.message.orEmpty()}")
+            }
             runCatching {
                 DiagnosticRecordLogger.geofence(
                     this@CheckInApp,
@@ -31,7 +40,15 @@ class CheckInApp : Application() {
                 )
                 DiagnosticRecordLogger.geofence(this@CheckInApp, "PROCESS_LAST_EXIT：${lastExit()}")
             }
-            runCatching { PollWatchdog.check(this@CheckInApp, "PROCESS_START") }
+            // 等 5 秒：让拉起进程的组件（闹钟、广播、界面）先启动服务，避免这里重复启动。
+            delay(5_000)
+            try {
+                MonitorKeeper.ensure(this@CheckInApp, "PROCESS_START")
+            } catch (error: Exception) {
+                runCatching {
+                    DiagnosticRecordLogger.geofence(this@CheckInApp, "KEEPER_ERROR：来源=PROCESS_START；${error.javaClass.simpleName}: ${error.message.orEmpty()}")
+                }
+            }
         }
     }
 

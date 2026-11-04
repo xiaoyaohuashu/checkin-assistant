@@ -77,6 +77,9 @@ class SettingsFragment : Fragment() {
         // ── 分组：关于 ──
         content.addView(section("关于", listOf(
             SettingRow(R.drawable.ic_info, Ui.Tint.SLATE, "版本信息", "查看当前版本", trailing = appVersionName()),
+            SettingRow(R.drawable.ic_download, Ui.Tint.BLUE, "检查更新", "有新版本时在应用内下载安装") {
+                com.checkinassistant.update.UpdatePrompt.check(requireActivity() as androidx.appcompat.app.AppCompatActivity, manual = true)
+            },
             SettingRow(R.drawable.ic_book_open, Ui.Tint.GREEN, "使用说明", "功能简介与使用方法") { showHelp() }
         )))
 

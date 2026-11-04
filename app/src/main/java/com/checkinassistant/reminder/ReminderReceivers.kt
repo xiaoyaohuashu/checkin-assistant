@@ -5,6 +5,7 @@ import com.checkinassistant.AlarmWakeLock
 import com.checkinassistant.data.AppDatabase
 import com.checkinassistant.data.DiagnosticRecordLogger
 import com.checkinassistant.geofence.GeofenceMonitoringService
+import com.checkinassistant.geofence.MonitorKeeper
 import com.checkinassistant.geofence.PollWatchdog
 import com.checkinassistant.geofence.cancelMonitoringReevaluation
 import com.checkinassistant.geofence.nextMonitoringChange
@@ -83,8 +84,11 @@ class BootReceiver : BroadcastReceiver() {
                     app,
                     "MONITOR_SYSTEM_EVENT：${intent.action ?: "<null>"}，已重新安排下一次时段评估=${nextChange ?: "无"}"
                 )
+                runCatching { MonitorKeeper.schedulePeriodicCheck(app) }
                 // Starting the service also removes any fence left by a clock/time-zone change.
-                GeofenceMonitoringService.start(app)
+                GeofenceMonitoringService.tryStart(app)?.let { failure ->
+                    DiagnosticRecordLogger.geofence(app, "MONITOR_SERVICE_START_FAILED：${intent.action ?: "<null>"} 后启动前台服务失败：${failure.javaClass.simpleName}: ${failure.message.orEmpty()}")
+                }
             } catch (error: Exception) {
                 DiagnosticRecordLogger.geofence(app, "MONITOR_SYSTEM_EVENT_FAILURE：${error.javaClass.simpleName}: ${error.message.orEmpty()}")
             } finally {

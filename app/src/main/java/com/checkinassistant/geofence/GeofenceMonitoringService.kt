@@ -5,6 +5,7 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.location.Location
 import android.os.Build
 import android.os.IBinder
@@ -12,15 +13,25 @@ import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import com.checkinassistant.AlarmWakeLock
+import com.checkinassistant.MainActivity
 import com.checkinassistant.data.*
+import com.checkinassistant.reminder.PointRules
 import com.checkinassistant.reminder.ReminderEngine
 import com.google.android.gms.location.*
 import com.google.android.gms.tasks.CancellationTokenSource
 import kotlinx.coroutines.*
 import kotlinx.coroutines.tasks.await
+import java.time.Instant
+import java.time.ZoneId
 
-/** Performs app-controlled checks only while at least one point is within its active window. */
+/**
+ * Performs app-controlled checks only while at least one point is within its active window.
+ *
+ * v2.2.14：只要有启用中的地点，前台服务就常驻；休眠期间只停定位轮询，常驻通知显示下次开始监测的时间。
+ * 以前休眠时服务自停、只留一个时段唤醒闹钟，进程被系统杀掉后闹钟没有触发，第二天的提醒全没响。
+ */
 class GeofenceMonitoringService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val db by lazy { AppDatabase.get(this) }
@@ -37,6 +48,15 @@ class GeofenceMonitoringService : Service() {
     private var pollPollableIds: List<Long> = emptyList()
     /** 上一次排下一轮时用的是不是闹钟类别；只在变化时记日志。 */
     private var lastTickExact: Boolean? = null
+    /** 常驻通知当前显示的状态文字。 */
+    @Volatile private var currentStatus = ""
+    /** 当前以哪种前台服务类型运行；0 = 不在前台。 */
+    @Volatile private var foregroundType = 0
+
+    override fun onCreate() {
+        super.onCreate()
+        isRunning = true
+    }
 
     /**
      * v2.2.12：不再是「一个 10 分钟唤醒锁 + 协程 delay 循环」。每一轮是一次独立的工作：
@@ -45,7 +65,10 @@ class GeofenceMonitoringService : Service() {
      */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         createChannel()
-        startForeground(FOREGROUND_ID, foregroundNotification())
+        if (!showStatus(pollActiveIds != null, currentStatus.ifEmpty { "正在检查监测时段…" }, force = true)) {
+            stopSelfResult(startId)
+            return START_NOT_STICKY
+        }
         val tick = intent?.action == ACTION_POLL_TICK
         // 到的是保底闹钟：上一轮没能走到「排下一轮」那一步（进程被杀，或那一轮超过了 90 秒）。
         val backupFired = tick && PollWatchdog.tickIsBackup(this)
@@ -54,7 +77,7 @@ class GeofenceMonitoringService : Service() {
             releaseTickHandoff()
             DiagnosticRecordLogger.trace("POLL_TICK_SKIPPED：上一轮还没结束")
             if (backupFired) scope.launch { logBackupAlarmFired("上一轮开始 ${POLL_BACKUP_MS / 1000}s 后仍未结束，本次不另起一轮") }
-            return START_NOT_STICKY
+            return START_STICKY
         }
         if (!tick) pollingJob?.cancel()
         pollingJob = scope.launch {
@@ -81,7 +104,8 @@ class GeofenceMonitoringService : Service() {
                 AlarmWakeLock.release(lock)
             }
         }
-        return START_NOT_STICKY
+        // 进程被杀后系统按 START_STICKY 重建服务（intent = null），照常重新评估生效时间段。
+        return START_STICKY
     }
 
     @SuppressLint("MissingPermission")
@@ -122,6 +146,7 @@ class GeofenceMonitoringService : Service() {
         pollActiveIds = activePoints.map { it.id }
         pollPollableIds = pollablePoints.map { it.id }
         PollWatchdog.markExpected(this, true)
+        showStatus(true, monitoringText(pollablePoints))
         pollCycle(startId)
     }
 
@@ -205,6 +230,7 @@ class GeofenceMonitoringService : Service() {
         }
         pollActiveIds = activeIds
         pollPollableIds = pollableIds
+        monitoringText(currentPollable).takeIf { it != currentStatus }?.let { showStatus(true, it) }
         pollOnce(currentPollable)
         return true
     }
@@ -279,18 +305,85 @@ class GeofenceMonitoringService : Service() {
         pollPollableIds = emptyList()
         cancelPollTick(this)
         PollWatchdog.markExpected(this, false)
-        val nextChange = nextMonitoringChange(points, System.currentTimeMillis())
+        val now = System.currentTimeMillis()
+        val nextChange = nextMonitoringChange(points, now)
         if (nextChange == null) {
             cancelMonitoringReevaluation(this)
-            DiagnosticRecordLogger.geofence(this, "MONITOR_SLEEP：$reason；没有已启用的分时段地点，停止前台服务")
+            DiagnosticRecordLogger.geofence(this, "MONITOR_SLEEP_WAKEUP：没有已启用的分时段地点，已取消时段唤醒闹钟")
         } else {
             val exact = scheduleMonitoringReevaluation(this, nextChange)
-            DiagnosticRecordLogger.geofence(this, "MONITOR_SLEEP：$reason；已安排${if (exact) "精确" else "非精确"}唤醒，时间=$nextChange（分时段开始前 ${WINDOW_WARMUP_MS / 60_000}s 或状态边界）")
+            DiagnosticRecordLogger.geofence(this, "MONITOR_SLEEP_WAKEUP：已安排${if (exact) "精确（setAlarmClock）" else "非精确"}唤醒，时间=$nextChange（分时段开始前 ${WINDOW_WARMUP_MS / 60_000}min 或状态边界）")
         }
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        // A wakeup or a point edit may have started this service again while this older
-        // coroutine was cleaning up.  Never stop that newer start request.
-        stopSelfResult(startId)
+        if (points.isEmpty()) {
+            DiagnosticRecordLogger.geofence(this, "MONITOR_SLEEP：$reason；没有已启用的地点，停止前台服务")
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            foregroundType = 0
+            // A wakeup or a point edit may have started this service again while this older
+            // coroutine was cleaning up.  Never stop that newer start request.
+            stopSelfResult(startId)
+            return
+        }
+        // v2.2.14：还有启用地点就不停服务，只是不定位。
+        val text = sleepingText(points, now)
+        showStatus(false, text)
+        DiagnosticRecordLogger.geofence(this, "MONITOR_SLEEP：$reason；前台服务常驻、不定位（$text）")
+    }
+
+    private fun monitoringText(points: List<CheckInPoint>) = "监测中 · ${points.joinToString("、") { it.name }}"
+
+    private fun sleepingText(points: List<CheckInPoint>, now: Long): String {
+        val next = points.filter { it.activeStartMinute != null && it.activeEndMinute != null }
+            .mapNotNull { PointRules.findNextActiveTime(it, now) }
+            .minOrNull() ?: return "休眠中 · 暂无待监测的时段"
+        val zone = ZoneId.systemDefault()
+        val at = Instant.ofEpochMilli(next).atZone(zone)
+        val today = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
+        val time = "%02d:%02d".format(at.hour, at.minute)
+        val day = when (at.toLocalDate()) {
+            today -> time
+            today.plusDays(1) -> "明天 $time"
+            else -> "${at.monthValue}月${at.dayOfMonth}日 $time"
+        }
+        return "休眠中 · 下次 $day 开始监测"
+    }
+
+    /**
+     * 更新常驻通知。类型：Android 14+ 监测中用 location、休眠中用 specialUse（长期运行不限时）；
+     * 14 以下一律 location。类型没变时只刷新通知文字。
+     * @return false = 所有 startForeground 尝试都失败（异常已写日志）。
+     */
+    private fun showStatus(monitoring: Boolean, text: String, force: Boolean = false): Boolean {
+        currentStatus = text
+        val notification = statusNotification(text)
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && !monitoring) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        } else {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+        }
+        if (!force && type == foregroundType) {
+            getSystemService(NotificationManager::class.java).notify(FOREGROUND_ID, notification)
+            return true
+        }
+        if (startForegroundAs(notification, type)) return true
+        // 14+ 上 location 类型被拒（例如定位权限被收回）时，退回 specialUse 保住常驻。
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+            type == ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION &&
+            startForegroundAs(notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+    }
+
+    private fun startForegroundAs(notification: Notification, type: Int): Boolean = try {
+        ServiceCompat.startForeground(this, FOREGROUND_ID, notification, type)
+        foregroundType = type
+        true
+    } catch (error: Exception) {
+        val app = applicationContext
+        val typeName = if (type == ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION) "location" else "specialUse"
+        CoroutineScope(Dispatchers.IO).launch {
+            runCatching {
+                DiagnosticRecordLogger.geofence(app, "MONITOR_SERVICE_START_FAILED：startForeground(type=$typeName) 失败：${error.javaClass.simpleName}: ${error.message.orEmpty()}")
+            }
+        }
+        false
     }
 
     private fun scheduleReevaluation(at: Long) {
@@ -324,10 +417,30 @@ class GeofenceMonitoringService : Service() {
         val background = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || ActivityCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED
         return "permission(fine=$fine,coarse=$coarse,background=$background,api=${Build.VERSION.SDK_INT})"
     }
-    private fun foregroundNotification() = NotificationCompat.Builder(this, CHANNEL_ID).setSmallIcon(android.R.drawable.ic_menu_mylocation).setContentTitle("别错过站正在主动定位监测").setContentText("仅在提醒点生效时间段内定位").setPriority(NotificationCompat.PRIORITY_LOW).setOngoing(true).build()
-    private fun createChannel() { getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel(CHANNEL_ID, "后台监测", NotificationManager.IMPORTANCE_LOW)) }
+    private fun statusNotification(text: String): Notification {
+        val open = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(this, STATUS_CHANNEL_ID).setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setContentTitle("别错过站").setContentText(text).setContentIntent(open)
+            .setOngoing(true).setOnlyAlertOnce(true).setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW).setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .build()
+    }
+    private fun createChannel() {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(NotificationChannel(STATUS_CHANNEL_ID, "常驻状态", NotificationManager.IMPORTANCE_LOW).apply {
+            setSound(null, null)
+            enableVibration(false)
+            enableLights(false)
+            setShowBadge(false)
+        })
+        runCatching { manager.deleteNotificationChannel(LEGACY_CHANNEL_ID) }
+    }
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onDestroy() {
+        isRunning = false
         logLifecycle("MONITOR_SERVICE_DESTROY：前台服务 onDestroy")
         pollingJob?.cancel()
         scope.cancel()
@@ -348,7 +461,12 @@ class GeofenceMonitoringService : Service() {
     }
 
     companion object {
-        const val CHANNEL_ID = "geofence_monitoring"
+        /** v2.2.14：常驻状态通知的独立渠道（低优先级、不响不震）；提醒用的 checkin_reminders_v3 不变。 */
+        const val STATUS_CHANNEL_ID = "monitor_status_v1"
+        private const val LEGACY_CHANNEL_ID = "geofence_monitoring"
+        /** 当前进程里服务实例是否存在（onCreate ~ onDestroy），供 [MonitorKeeper] 判断要不要重新拉起。 */
+        @Volatile var isRunning = false
+            private set
         private const val FOREGROUND_ID = 301
         private const val POLL_INTERVAL_MS = 25_000L
         /** 每轮开始时排的保底闹钟：比每轮持锁上限（60s）长，正常的一轮一定先结束并覆盖它。 */
@@ -377,9 +495,21 @@ class GeofenceMonitoringService : Service() {
         /** v5 任务四: polling fixes coarser than this are discarded (drift guard). */
         private const val POLL_MAX_ACCURACY_M = 50f
         private const val LOCATION_QUERY_TIMEOUT_MS = 15_000L
-        fun start(context: Context) = androidx.core.content.ContextCompat.startForegroundService(context, Intent(context, GeofenceMonitoringService::class.java))
+        fun start(context: Context) {
+            // 任何一次启动都代表要监测，清掉「用户手动停止」。
+            MonitorKeeper.setUserStopped(context, false)
+            androidx.core.content.ContextCompat.startForegroundService(context, Intent(context, GeofenceMonitoringService::class.java))
+        }
+        /** 同 [start]，但不抛异常：@return null = 已发出启动请求；否则是启动时的异常。 */
+        fun tryStart(context: Context): Exception? = try {
+            start(context)
+            null
+        } catch (error: Exception) {
+            error
+        }
         /** v7: 停止后台监测（首页「停止后台监测」按钮）。 */
         fun stop(context: Context) {
+            MonitorKeeper.setUserStopped(context, true)
             // 用户手动停止：取消还没到的轮询闹钟，并告诉看门狗不要再把它拉起来。
             cancelPollTick(context)
             PollWatchdog.markExpected(context, false)

@@ -10,6 +10,8 @@ import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.EditText
+import android.widget.HorizontalScrollView
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -21,6 +23,7 @@ import androidx.lifecycle.lifecycleScope
 import com.checkinassistant.data.AppDatabase
 import com.checkinassistant.data.CheckInPoint
 import com.checkinassistant.data.CheckInRecord
+import com.checkinassistant.data.DayNote
 import com.checkinassistant.data.PointColors
 import com.checkinassistant.data.PointEnabledEvent
 import com.checkinassistant.data.PointSkipEvent
@@ -48,7 +51,14 @@ class HistoryFragment : Fragment() {
     private val pointDao by lazy { AppDatabase.get(requireContext()).checkInPointDao() }
     private val eventDao by lazy { AppDatabase.get(requireContext()).pointEnabledEventDao() }
     private val skipEventDao by lazy { AppDatabase.get(requireContext()).pointSkipEventDao() }
+    private val dayNoteDao by lazy { AppDatabase.get(requireContext()).dayNoteDao() }
     private var job: Job? = null
+    private var notesJob: Job? = null
+
+    /** v2.2.15: 当前月份的日期备注（按日）。 */
+    private var notesByDay: Map<Int, DayNote> = emptyMap()
+    private var monthStartShown: Calendar = Calendar.getInstance()
+    private lateinit var dayNoteCard: LinearLayout
     private val calendar = Calendar.getInstance()
     private lateinit var headerRow: LinearLayout
     private lateinit var monthTitle: TextView
@@ -83,7 +93,7 @@ class HistoryFragment : Fragment() {
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View =
         createContent()
 
-    override fun onDestroyView() { job?.cancel(); super.onDestroyView() }
+    override fun onDestroyView() { job?.cancel(); notesJob?.cancel(); super.onDestroyView() }
 
     /**
      * v9: 进入页面即渲染完整月历（月份标题 + 全部日期格子）。
@@ -127,6 +137,9 @@ class HistoryFragment : Fragment() {
         cellWidth = (gridWidth - dp(6) * 6) / 7
 
         content.addView(buildCalendarCard(), LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(16) })
+        // v2.2.15: 日期备注卡，紧跟月历，跟着选中日期变化
+        dayNoteCard = Ui.card(context, radiusDp = 22, paddingDp = 16)
+        content.addView(dayNoteCard, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(16) })
         content.addView(buildStatsCard(), LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(16) })
         // v9: 统计卡之后直接是操作卡（原「当日打卡记录」模块已删除）
         content.addView(buildActionCards(), LinearLayout.LayoutParams(-1, -2))
@@ -324,6 +337,19 @@ class HistoryFragment : Fragment() {
             set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
         }
         val end = (start.clone() as Calendar).apply { add(Calendar.MONTH, 1) }
+        monthStartShown = start
+        // 换月后选中日不能超过该月天数（比如 31 号切到 11 月）
+        selectedDay = selectedDay.coerceIn(1, start.getActualMaximum(Calendar.DAY_OF_MONTH))
+        notesByDay = emptyMap()
+        renderDayNoteCard()
+        notesJob?.cancel()
+        notesJob = viewLifecycleOwner.lifecycleScope.launch {
+            dayNoteDao.observeMonth(monthPrefix(start)).collectLatest { notes ->
+                notesByDay = notes.associateBy { it.date.substring(8).toInt() }
+                renderCalendar(start)
+                renderDayNoteCard()
+            }
+        }
         job?.cancel()
         job = viewLifecycleOwner.lifecycleScope.launch {
             combine(
@@ -473,10 +499,32 @@ class HistoryFragment : Fragment() {
             dotRow(records),
             FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(6) }
         )
+        // v2.2.15: 有备注的日期右上角一个橙色小角标
+        if (notesByDay.containsKey(day)) {
+            cell.addView(
+                View(context).apply { background = Ui.circle(NOTE_ACCENT) },
+                FrameLayout.LayoutParams(dp(6), dp(6), Gravity.TOP or Gravity.END).apply {
+                    topMargin = dp(6); rightMargin = dp(6)
+                }
+            )
+        }
         // v7: 点击任意日期 → 选中并高亮（原型 setSelected）；仅重绘日历，不改变页面高度
+        // v2.2.15: 再点一次已选中的日期、或长按日期 → 直接写备注
         cell.setOnClickListener {
+            if (selectedDay == day) {
+                editDayNote(day)
+            } else {
+                selectedDay = day
+                renderCalendar(monthStartShown)
+                renderDayNoteCard()
+            }
+        }
+        cell.setOnLongClickListener {
             selectedDay = day
-            renderCalendar(calendar.clone() as Calendar)
+            renderCalendar(monthStartShown)
+            renderDayNoteCard()
+            editDayNote(day)
+            true
         }
         return cell
     }
@@ -636,6 +684,144 @@ class HistoryFragment : Fragment() {
         }
     }
 
+    // ── v2.2.15: 日期备注 ─────────────────────────────────────
+
+    private fun monthPrefix(monthStart: Calendar) =
+        "%04d-%02d-".format(monthStart.get(Calendar.YEAR), monthStart.get(Calendar.MONTH) + 1)
+
+    private fun dateKey(day: Int) = monthPrefix(monthStartShown) + "%02d".format(day)
+
+    private fun dayLabel(day: Int): String {
+        val date = java.time.LocalDate.of(
+            monthStartShown.get(Calendar.YEAR), monthStartShown.get(Calendar.MONTH) + 1, day
+        )
+        val week = arrayOf("一", "二", "三", "四", "五", "六", "日")[date.dayOfWeek.value - 1]
+        return "${date.monthValue}月${day}日 周$week"
+    }
+
+    /** 备注卡：上面是选中日期的备注（点一下就能写），下面列出本月其它有备注的日期。 */
+    private fun renderDayNoteCard() {
+        if (!::dayNoteCard.isInitialized) return
+        val context = requireContext()
+        dayNoteCard.removeAllViews()
+
+        val titleRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), 0, dp(4), 0)
+        }
+        titleRow.addView(
+            Ui.text(context, 16f, Ui.TEXT_MAIN, Ui.BOLD, "日期备注").tight(),
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        titleRow.addView(
+            Ui.text(context, 12f, Ui.TEXT_SUB, Typeface.DEFAULT,
+                if (notesByDay.isEmpty()) "本月暂无" else "本月 ${notesByDay.size} 条")
+        )
+        dayNoteCard.addView(titleRow, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+
+        val selectedNote = notesByDay[selectedDay]
+        dayNoteCard.addView(
+            noteRow(selectedDay, selectedNote?.note, highlighted = true),
+            LinearLayout.LayoutParams(-1, -2)
+        )
+        notesByDay.toSortedMap().filterKeys { it != selectedDay }.forEach { (day, note) ->
+            dayNoteCard.addView(
+                noteRow(day, note.note, highlighted = false),
+                LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) }
+            )
+        }
+    }
+
+    private fun noteRow(day: Int, note: String?, highlighted: Boolean): View {
+        val context = requireContext()
+        return LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = Ui.rounded(if (highlighted) NOTE_BG else Ui.ROW_BG, 18, context)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            isClickable = true
+            setOnClickListener {
+                if (selectedDay != day) {
+                    selectedDay = day
+                    renderCalendar(monthStartShown)
+                    renderDayNoteCard()
+                }
+                editDayNote(day)
+            }
+            addView(
+                Ui.text(context, 13f, if (highlighted) NOTE_ACCENT_DARK else Ui.TEXT_SUB, Ui.SEMIBOLD, dayLabel(day)),
+                LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(12) }
+            )
+            addView(
+                if (note != null) {
+                    Ui.text(context, 14f, Ui.TEXT_MAIN, Typeface.DEFAULT, note)
+                } else {
+                    Ui.text(context, 13f, Ui.TEXT_SUB, Typeface.DEFAULT, "暂无备注，点这里添加")
+                },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            )
+        }
+    }
+
+    /** 写/改/删某天的备注。保存空内容等于删除。 */
+    private fun editDayNote(day: Int) {
+        val context = requireContext()
+        val key = dateKey(day)
+        val existing = notesByDay[day]
+        val input = EditText(context).apply {
+            hint = "比如：休息，考勤算上班"
+            setText(existing?.note.orEmpty())
+            setSelection(text.length)
+            minLines = 2
+            maxLines = 5
+        }
+        val chips = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+        QUICK_NOTES.forEach { label ->
+            chips.addView(
+                Ui.pill(context, label, NOTE_BG, NOTE_ACCENT_DARK).apply {
+                    setPadding(dp(12), dp(8), dp(12), dp(8))
+                    isClickable = true
+                    setOnClickListener {
+                        val current = input.text.toString().trim()
+                        input.setText(if (current.isEmpty()) label else "$current，$label")
+                        input.setSelection(input.text.length)
+                    }
+                },
+                LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(8) }
+            )
+        }
+        val body = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), 0)
+            addView(
+                HorizontalScrollView(context).apply {
+                    isHorizontalScrollBarEnabled = false
+                    addView(chips)
+                },
+                LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) }
+            )
+            addView(input, LinearLayout.LayoutParams(-1, -2))
+        }
+        val builder = AlertDialog.Builder(context)
+            .setTitle(dayLabel(day))
+            .setView(body)
+            .setPositiveButton("保存") { _, _ ->
+                val text = input.text.toString().trim()
+                viewLifecycleOwner.lifecycleScope.launch {
+                    if (text.isEmpty()) dayNoteDao.delete(key)
+                    else dayNoteDao.upsert(DayNote(key, text))
+                }
+            }
+            .setNegativeButton("取消", null)
+        if (existing != null) {
+            builder.setNeutralButton("删除") { _, _ ->
+                viewLifecycleOwner.lifecycleScope.launch { dayNoteDao.delete(key) }
+            }
+        }
+        builder.show()
+    }
+
     private fun pickMonth() = DatePickerDialog(
         requireContext(),
         { _, year, month, _ -> calendar.set(year, month, 1); observeMonth() },
@@ -643,4 +829,11 @@ class HistoryFragment : Fragment() {
     ).show()
 
     private fun dp(value: Int) = (value * requireContext().resources.displayMetrics.density).toInt()
+
+    private companion object {
+        val NOTE_ACCENT = Color.rgb(0xF5, 0x9E, 0x0B)
+        val NOTE_ACCENT_DARK = Color.rgb(0xB4, 0x6A, 0x00)
+        val NOTE_BG = Color.rgb(0xFF, 0xF6, 0xE5)
+        val QUICK_NOTES = listOf("休息，考勤算上班", "调休", "请假", "出差", "居家办公")
+    }
 }

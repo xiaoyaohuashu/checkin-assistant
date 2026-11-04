@@ -100,6 +100,7 @@ internal fun monitoringScheduleIntent(context: Context): PendingIntent = Pending
 )
 
 internal fun scheduleMonitoringReevaluation(context: Context, at: Long): Boolean {
+    MonitorKeeper.markWakeupScheduled(context, at)
     val alarm = context.getSystemService(AlarmManager::class.java)
     val pendingIntent = monitoringScheduleIntent(context)
     // v2.2.11：与 25 秒定位复核闹钟一致，改用 setAlarmClock（系统里最高优先级的闹钟类别，
@@ -153,5 +154,6 @@ internal fun cancelPollTick(context: Context) {
 }
 
 internal fun cancelMonitoringReevaluation(context: Context) {
+    MonitorKeeper.markWakeupScheduled(context, null)
     context.getSystemService(AlarmManager::class.java).cancel(monitoringScheduleIntent(context))
 }

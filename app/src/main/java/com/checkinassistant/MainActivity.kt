@@ -149,6 +149,18 @@ class MainActivity : AppCompatActivity() {
         // 配置变更/进程恢复后 ViewPager2 会把自己恢复到原来的页码，而底部导航是按 0 新建的，
         // 这里补一次对齐，保证「当前页 ↔ 导航选中态」始终一致。
         if (::pager.isInitialized && pager.currentItem != currentTab) onPageChanged(pager.currentItem)
+        // v2.2.16：点了「有新版本」通知就强制查一次并弹框，否则按 6 小时间隔自动查。
+        val fromNotification = intent?.getBooleanExtra(com.checkinassistant.update.UpdateCheckWorker.EXTRA_SHOW_UPDATE, false) == true
+        if (fromNotification) {
+            intent.removeExtra(com.checkinassistant.update.UpdateCheckWorker.EXTRA_SHOW_UPDATE)
+            com.checkinassistant.update.UpdateCheckWorker.cancelNotification(this)
+        }
+        com.checkinassistant.update.UpdatePrompt.check(this, manual = false, force = fromNotification)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
     }
 
     private fun createContent(): View {

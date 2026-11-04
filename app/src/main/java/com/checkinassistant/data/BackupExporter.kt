@@ -5,7 +5,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * v6: full data export (points / records / skip events / enable events) as one
+ * v6: full data export (points / records / day notes) as one
  * JSON document. Pure read — never mutates the database.
  */
 object BackupExporter {
@@ -37,6 +37,11 @@ object BackupExporter {
                     put("pointId", r.pointId); put("pointName", r.pointName)
                     put("triggeredAt", r.triggeredAt); put("status", r.status)
                 })
+            }
+        })
+        out.put("dayNotes", JSONArray().apply {
+            db.dayNoteDao().getAllOnce().forEach { n ->
+                put(JSONObject().apply { put("date", n.date); put("note", n.note) })
             }
         })
         return out.toString(2)

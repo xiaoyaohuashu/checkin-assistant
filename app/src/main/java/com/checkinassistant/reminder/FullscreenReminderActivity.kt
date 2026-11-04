@@ -26,6 +26,10 @@ import kotlinx.coroutines.launch
  * Ringer/vibration reuse ReminderEngine's process-wide alert session so the two
  * paths never overlap; the user's action stops the loop and routes through
  * ReminderEngine.finish / snooze exactly like the notification actions.
+ *
+ * v2.2.14：本页有独立的 taskAffinity（manifest），关闭时只用 finish()。以前它和主界面同在一个
+ * 任务里，点按钮后 finishAndRemoveTask() 把整个任务移除，触发了前台服务的 onTaskRemoved
+ * （日志里的 MONITOR_SERVICE_TASK_REMOVED，用户并没有划掉 App）。
  */
 class FullscreenReminderActivity : AppCompatActivity() {
 
@@ -111,7 +115,7 @@ class FullscreenReminderActivity : AppCompatActivity() {
             ReminderEngine.complete(app, pointId)
             DiagnosticRecordLogger.geofence(app, "FULLSCREEN_ACTION：#$pointId 我已到达")
         }
-        finishAndRemoveTask()
+        finish()
     }
 
     private fun close() {
@@ -121,7 +125,7 @@ class FullscreenReminderActivity : AppCompatActivity() {
             ReminderEngine.snooze(app, pointId)
             DiagnosticRecordLogger.geofence(app, "FULLSCREEN_ACTION：#$pointId 稍后提醒")
         }
-        finishAndRemoveTask()
+        finish()
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()

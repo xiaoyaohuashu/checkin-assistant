@@ -6,6 +6,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <!-- v2.2.14：休眠期间前台服务常驻（不定位）用 specialUse 类型，不会像 dataSync 那样被限时 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- 生效时间段内的主动定位轮询需要保持 CPU 可用，否则 Doze 下 25s 复核会被拉长 -->
@@ -14,6 +16,8 @@
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <!-- v4 §2.2: alarm-style full-screen reminder over the lock screen (Android 14+ gate). -->
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- v2.2.16：应用内更新，下载新版 APK 后交给系统安装器 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:name=".CheckInApp"
@@ -36,6 +40,7 @@
             android:name=".reminder.FullscreenReminderActivity"
             android:exported="false"
             android:excludeFromRecents="true"
+            android:taskAffinity="com.checkinassistant.fullscreen"
             android:showOnLockScreen="true"
             android:launchMode="singleTop" />
         <provider
@@ -47,7 +52,14 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
-        <service android:name=".geofence.GeofenceMonitoringService" android:foregroundServiceType="location" android:exported="false" />
+        <service
+            android:name=".geofence.GeofenceMonitoringService"
+            android:foregroundServiceType="location|specialUse"
+            android:exported="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the commute reminder schedule alive between monitoring windows so the next location window starts on time; no location access while in this state." />
+        </service>
         <receiver android:name=".geofence.GeofenceBroadcastReceiver" android:exported="false" />
         <receiver android:name=".geofence.MonitoringScheduleReceiver" android:exported="false" />
         <receiver android:name=".reminder.ReminderAlarmReceiver" android:exported="false" />

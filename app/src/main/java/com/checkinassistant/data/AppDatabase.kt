@@ -7,13 +7,14 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
-@Database(entities = [CheckInPoint::class, CheckInRecord::class, ReminderState::class, PointEnabledEvent::class, PointSkipEvent::class], version = 8, exportSchema = false)
+@Database(entities = [CheckInPoint::class, CheckInRecord::class, ReminderState::class, PointEnabledEvent::class, PointSkipEvent::class, DayNote::class], version = 9, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun checkInPointDao(): CheckInPointDao
     abstract fun recordDao(): RecordDao
     abstract fun reminderDao(): ReminderDao
     abstract fun pointEnabledEventDao(): PointEnabledEventDao
     abstract fun pointSkipEventDao(): PointSkipEventDao
+    abstract fun dayNoteDao(): DayNoteDao
 
     companion object {
         @Volatile private var instance: AppDatabase? = null
@@ -21,7 +22,7 @@ abstract class AppDatabase : RoomDatabase() {
         fun get(context: Context): AppDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(
                 context.applicationContext, AppDatabase::class.java, "checkin-assistant.db"
-            ).addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8).build().also { instance = it }
+            ).addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9).build().also { instance = it }
         }
 
         private val MIGRATION_4_5 = object : Migration(4, 5) {
@@ -68,6 +69,19 @@ abstract class AppDatabase : RoomDatabase() {
                         "`createdAt` INTEGER NOT NULL)"
                 )
                 database.execSQL("CREATE INDEX IF NOT EXISTS `index_point_skip_events_reminderPointId` ON `point_skip_events` (`reminderPointId`)")
+            }
+        }
+
+        /** v2.2.15: 日期备注表。 */
+        private val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `day_notes` (" +
+                        "`date` TEXT NOT NULL, " +
+                        "`note` TEXT NOT NULL, " +
+                        "`updatedAt` INTEGER NOT NULL, " +
+                        "PRIMARY KEY(`date`))"
+                )
             }
         }
     }

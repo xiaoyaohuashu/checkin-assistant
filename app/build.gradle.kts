@@ -22,6 +22,15 @@ fun loadMapsApiKey(): String {
         )
 }
 
+/** local.properties 里的可选项；文件或键不存在时返回空字符串。 */
+fun loadOptionalLocalProperty(key: String): String {
+    val propsFile = rootProject.file("local.properties")
+    if (!propsFile.exists()) return ""
+    val props = Properties()
+    propsFile.inputStream().use { props.load(it) }
+    return props.getProperty(key)?.trim().orEmpty()
+}
+
 android {
     namespace = "com.checkinassistant"
     compileSdk = 34
@@ -30,10 +39,12 @@ android {
         applicationId = "com.checkinassistant"
         minSdk = 29
         targetSdk = 34
-        versionCode = 35
-        versionName = "2.2.13"
+        versionCode = 40
+        versionName = "2.2.17"
 
         manifestPlaceholders["GOOGLE_MAPS_API_KEY"] = loadMapsApiKey()
+        // v2.2.16 应用内更新：version.json 地址放 local.properties（不进公开仓库），没配就关闭更新功能
+        resValue("string", "update_manifest_url", loadOptionalLocalProperty("UPDATE_URL"))
     }
 
     compileOptions {
@@ -69,5 +80,6 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3")
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
     kapt("androidx.room:room-compiler:2.6.1")
 }
