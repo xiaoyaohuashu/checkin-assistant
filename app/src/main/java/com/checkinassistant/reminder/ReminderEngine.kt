@@ -2,10 +2,6 @@ package com.checkinassistant.reminder
 
 import android.app.*
 import android.content.*
-import android.media.AudioAttributes
-import android.media.AudioFocusRequest
-import android.media.AudioManager
-import android.media.Ringtone
 import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
@@ -47,8 +43,7 @@ object ReminderEngine {
     // One process-wide alert session prevents overlapping vibrator/ringtone sources.
     private var alertPointId: Long? = null
     private var vibrator: Vibrator? = null
-    private var ringtone: Ringtone? = null
-    private var audioFocusRequest: AudioFocusRequest? = null
+    private var soundPlayer: AlertSoundPlayer? = null
 
     /**
      * @param knownLocation 调用方（前台轮询兜底复核）本轮刚取得的定位。传入时直接复用，
@@ -388,38 +383,44 @@ object ReminderEngine {
         startAlert(context, point.id)
     }
     @Synchronized private fun startAlert(context: Context, pointId: Long) {
-        if (alertPointId == pointId && ringtone?.isPlaying == true) return
+        if (alertPointId == pointId && soundPlayer?.isPlaying == true) return
         stopAlert(context, null)
         alertPointId = pointId
         vibrator = context.getSystemService(Vibrator::class.java)?.also {
             // Repeat from index 0: 450ms vibration, 180ms pause, then indefinitely.
             it.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 450, 180), 0))
         }
-        val audioManager = context.getSystemService(AudioManager::class.java)
-        val attributes = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE).setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build()
-        audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT).setAudioAttributes(attributes).setOnAudioFocusChangeListener { }.build()
-        if (audioManager.requestAudioFocus(audioFocusRequest!!) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
-            ringtone = try { RingtoneManager.getRingtone(context, selectedRingtoneUri(context))?.apply { audioAttributes = attributes; isLooping = true; play() } } catch (_: Exception) { null }
+        // 声音由 App 自己播放：连蓝牙耳机只走耳机，否则外放（见 AlertSoundPlayer）。
+        soundPlayer = AlertSoundPlayer(context.applicationContext, pointId, selectedRingtoneUri(context)).also {
+            try { it.start() } catch (_: Exception) { }
         }
     }
     @Synchronized internal fun stopAlert(context: Context, pointId: Long?) {
         if (pointId != null && alertPointId != pointId) return
         vibrator?.cancel(); vibrator = null
-        ringtone?.stop(); ringtone = null
-        audioFocusRequest?.let { context.getSystemService(AudioManager::class.java).abandonAudioFocusRequest(it) }
-        audioFocusRequest = null; alertPointId = null
+        soundPlayer?.stop(); soundPlayer = null
+        alertPointId = null
     }
-    private fun selectedRingtoneUri(context: Context): Uri {
+    /** null = 用户选了「静音」。 */
+    private fun selectedRingtoneUri(context: Context): Uri? {
         val saved = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE).getString(KEY_RINGTONE_URI, null)
-        return saved?.let(Uri::parse) ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+            ?: return RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+        return saved.takeIf { it.isNotBlank() }?.let(Uri::parse)
     }
-    private fun createChannel(manager: NotificationManager) { if (Build.VERSION.SDK_INT >= 26) manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "到达提醒", NotificationManager.IMPORTANCE_HIGH).apply { enableVibration(false); setSound(null, null) }) }
+    private fun createChannel(manager: NotificationManager) {
+        if (Build.VERSION.SDK_INT < 26) return
+        // 渠道本身不响不振：声音由 AlertSoundPlayer 播放，振动由 startAlert 负责。
+        manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "到达提醒", NotificationManager.IMPORTANCE_HIGH).apply { enableVibration(false); setSound(null, null) })
+        LEGACY_CHANNEL_IDS.forEach { runCatching { manager.deleteNotificationChannel(it) } }
+    }
     private fun actionPending(context: Context, id: Long, action: String) = PendingIntent.getBroadcast(context, ((id % 1_000_000) + if (action == NotificationActionReceiver.ACTION_COMPLETE) 1_000_000 else 2_000_000).toInt(), Intent(context, NotificationActionReceiver::class.java).setAction(action).putExtra(EXTRA_POINT_ID, id), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
     private fun newRecord(point: CheckInPoint, time: Long): CheckInRecord { val c = Calendar.getInstance().apply { timeInMillis = time }; return CheckInRecord(pointId = point.id, pointName = point.name, triggeredAt = time, year = c.get(Calendar.YEAR), month = c.get(Calendar.MONTH) + 1, day = c.get(Calendar.DAY_OF_MONTH), weekday = c.get(Calendar.DAY_OF_WEEK), hour = c.get(Calendar.HOUR_OF_DAY), minute = c.get(Calendar.MINUTE), second = c.get(Calendar.SECOND)) }
     private fun formatMinute(minute: Int) = "%02d:%02d".format(minute / 60, minute % 60)
     // Notification-channel importance is immutable once Android has created it.  Use a
     // new ID so devices that retained an older channel configuration start from HIGH.
-    const val CHANNEL_ID = "checkin_reminders_v3"
+    // v4 (2.2.18): 声音统一由 App 播放（耳机/外放切换），渠道静音。
+    const val CHANNEL_ID = "checkin_reminders_v4"
+    private val LEGACY_CHANNEL_IDS = listOf("checkin_reminders_v3")
     private const val ALERT_NOTIFICATION_TAG = "checkin_reminder_alert"
 }
 

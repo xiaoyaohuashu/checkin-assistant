@@ -39,8 +39,8 @@ android {
         applicationId = "com.checkinassistant"
         minSdk = 29
         targetSdk = 34
-        versionCode = 40
-        versionName = "2.2.17"
+        versionCode = 42
+        versionName = "2.2.19"
 
         manifestPlaceholders["GOOGLE_MAPS_API_KEY"] = loadMapsApiKey()
         // v2.2.16 应用内更新：version.json 地址放 local.properties（不进公开仓库），没配就关闭更新功能
