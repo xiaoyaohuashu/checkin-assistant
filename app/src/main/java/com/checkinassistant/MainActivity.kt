@@ -70,7 +70,24 @@ class MainActivity : AppCompatActivity() {
         if (result.resultCode == RESULT_OK && uri != null) {
             getSharedPreferences("reminder_settings", MODE_PRIVATE).edit().putString("ringtone_uri", uri.toString()).apply()
             Toast.makeText(this, "提醒铃声已保存", Toast.LENGTH_SHORT).show()
+            askRingtonePermissionIfNeeded(force = true)
         }
+    }
+
+    /** 2.2.21：自选铃声需要「音乐和音频」权限才能由 App 自己播放。 */
+    private val ringtonePermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        Toast.makeText(
+            this,
+            if (granted) "已允许读取音频，提醒会播放你选的铃声" else "未允许读取音频，提醒将改用系统默认铃声",
+            Toast.LENGTH_LONG
+        ).show()
+    }
+
+    internal fun askRingtonePermissionIfNeeded(force: Boolean = false) {
+        if (!com.checkinassistant.reminder.RingtonePermission.needed(this)) return
+        if (!force && com.checkinassistant.reminder.RingtonePermission.askedThisProcess) return
+        com.checkinassistant.reminder.RingtonePermission.askedThisProcess = true
+        ringtonePermissionLauncher.launch(com.checkinassistant.reminder.RingtonePermission.permission)
     }
 
     private val mapPicker = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -145,6 +162,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        askRingtonePermissionIfNeeded()
         if (::monitoringText.isInitialized) refreshMonitoringStatus()
         // 配置变更/进程恢复后 ViewPager2 会把自己恢复到原来的页码，而底部导航是按 0 新建的，
         // 这里补一次对齐，保证「当前页 ↔ 导航选中态」始终一致。

@@ -7,7 +7,6 @@ import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.MediaPlayer
-import android.media.Ringtone
 import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
@@ -25,7 +24,9 @@ import kotlinx.coroutines.launch
  *   只在耳机里响；媒体音量过低时临时调高，停止时恢复。
  * - 没连耳机：USAGE_ALARM 外放。
  * - 响铃中耳机断开（AudioDeviceCallback）：自动切成外放继续响。
- * - 手机不在响铃模式（静音/振动）：不出声，与旧版 USAGE_NOTIFICATION_RINGTONE 被系统静音的行为一致。
+ * - 振动模式（2.2.20 起）：连着蓝牙耳机就照样在耳机里响（USAGE_MEDIA 不受振动模式静音）；
+ *   没连耳机不出声，响铃中耳机断开就停声，不会外放。
+ * - 静音模式：不出声。
  *
  * 振动不在这里处理，仍由 [ReminderEngine] 负责。
  */
@@ -37,17 +38,17 @@ internal class AlertSoundPlayer(
     private val audioManager = context.getSystemService(AudioManager::class.java)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var player: MediaPlayer? = null
-    /** App 自己读不到选定铃声时（自加歌曲需要音频权限），交给系统铃声播放器播放。 */
-    private var ringtone: Ringtone? = null
     private var focusRequest: AudioFocusRequest? = null
     private var headsetDevice: AudioDeviceInfo? = null
     /** 临时调高媒体音量前的原值；null 表示没有调过。 */
     private var savedMusicVolume: Int? = null
     private var raisedMusicVolume: Int? = null
     private var deviceCallbackRegistered = false
+    /** 振动模式：只允许走耳机，绝不外放。 */
+    private var headsetOnly = false
     @Volatile private var released = false
 
-    val isPlaying: Boolean get() = runCatching { player?.isPlaying == true || ringtone?.isPlaying == true }.getOrDefault(false)
+    val isPlaying: Boolean get() = runCatching { player?.isPlaying == true }.getOrDefault(false)
 
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
@@ -62,8 +63,7 @@ internal class AlertSoundPlayer(
                     log("ALERT_SOUND_SWITCH：#$pointId 耳机「${current.label()}」断开，改用另一个耳机「${other.label()}」")
                     startHeadset(other)
                 } else {
-                    log("ALERT_SOUND_SWITCH：#$pointId 耳机「${current.label()}」断开，自动切换外放继续响")
-                    startSpeaker()
+                    speakerOrSilence("ALERT_SOUND_SWITCH：#$pointId 耳机「${current.label()}」断开")
                 }
             }
         }
@@ -74,14 +74,21 @@ internal class AlertSoundPlayer(
             log("ALERT_SOUND：#$pointId 铃声设为静音，本次不出声（仅振动）")
             return
         }
-        val ringerMode = audioManager.ringerMode
-        if (ringerMode != AudioManager.RINGER_MODE_NORMAL) {
-            log("ALERT_SOUND：#$pointId 手机不在响铃模式（ringerMode=$ringerMode），本次不出声（仅振动）")
+        when (val ringerMode = audioManager.ringerMode) {
+            AudioManager.RINGER_MODE_NORMAL -> headsetOnly = false
+            AudioManager.RINGER_MODE_VIBRATE -> headsetOnly = true
+            else -> {
+                log("ALERT_SOUND：#$pointId 手机在静音模式（ringerMode=$ringerMode），本次不出声（仅振动）")
+                return
+            }
+        }
+        val headset = findBluetoothOutput()
+        if (headset == null && headsetOnly) {
+            log("ALERT_SOUND：#$pointId 振动模式且没连蓝牙耳机，本次不出声（仅振动）")
             return
         }
         audioManager.registerAudioDeviceCallback(deviceCallback, mainHandler)
         deviceCallbackRegistered = true
-        val headset = findBluetoothOutput()
         if (headset != null) startHeadset(headset) else startSpeaker()
     }
 
@@ -109,13 +116,26 @@ internal class AlertSoundPlayer(
         requestFocus(attributes)
         val how = startPlayback(attributes, device)
         if (how == null) {
-            log("ALERT_SOUND_ERROR：#$pointId 耳机播放器创建失败，改为外放")
-            startSpeaker()
+            speakerOrSilence("ALERT_SOUND_ERROR：#$pointId 耳机播放器创建失败")
             return
         }
-        log("ALERT_SOUND：#$pointId 本次走耳机「${device.label()}」(type=${device.type})，USAGE_MEDIA，" +
+        log("ALERT_SOUND：#$pointId 本次走耳机「${device.label()}」(type=${device.type})${if (headsetOnly) "（振动模式）" else ""}，USAGE_MEDIA，" +
             "$how，媒体音量=${audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)}/${audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)}" +
             (savedMusicVolume?.let { "（原音量 $it，已临时调高）" } ?: ""))
+    }
+
+    /** 耳机用不了时：响铃模式改外放；振动模式停声，只剩振动。 */
+    private fun speakerOrSilence(reason: String) {
+        if (headsetOnly) {
+            log("$reason，振动模式不外放，停止出声（仅振动）")
+            releasePlayer()
+            restoreMusicVolume()
+            abandonFocus()
+            headsetDevice = null
+        } else {
+            log("$reason，自动切换外放继续响")
+            startSpeaker()
+        }
     }
 
     private fun startSpeaker() {
@@ -141,36 +161,21 @@ internal class AlertSoundPlayer(
 
     /**
      * 按顺序尝试：① App 用 MediaPlayer 直接放选定铃声（可 setPreferredDevice）；
-     * ② App 读不到时交给系统铃声播放器（Ringtone 由系统代放，不需要 App 有音频权限，
-     *    路由按 AudioAttributes 走：USAGE_MEDIA 进耳机、USAGE_ALARM 外放）；
-     * ③ 都不行再用系统默认来电/闹钟铃声。
+     * ② 读不到（多半是没给「音乐和音频」权限）就用系统默认来电/闹钟铃声，仍由 App 自己播放。
+     * 2.2.21 起不再交给系统铃声播放器（Ringtone）：它在系统进程里放，App 崩了也不停。
      * @return 本次播放方式的说明（写进日志）；null 表示全部失败。
      */
     private fun startPlayback(attributes: AudioAttributes, preferredDevice: AudioDeviceInfo?): String? {
         val selected = uri ?: return null
         val (mp, error) = prepareMediaPlayer(selected, attributes)
         if (mp != null) return startMediaPlayer(mp, preferredDevice, "App 直接播放")
-        val rt = try {
-            RingtoneManager.getRingtone(context, selected)?.apply {
-                audioAttributes = attributes
-                isLooping = true
-                play()
-            }
-        } catch (e: Exception) {
-            log("ALERT_SOUND_ERROR：#$pointId 系统铃声播放器也打不开选定铃声：${e.javaClass.simpleName} ${e.message}")
-            null
-        }
-        if (rt != null) {
-            ringtone = rt
-            return "选定铃声交给系统播放器（App 无法直接读取：$error）"
-        }
         val fallbacks = listOf(
             RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE),
             RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM),
         ).filter { it != selected }
         for (candidate in fallbacks) {
             val fallback = prepareMediaPlayer(candidate, attributes).first ?: continue
-            return startMediaPlayer(fallback, preferredDevice, "选定铃声无法播放（$error），改用系统默认铃声")
+            return startMediaPlayer(fallback, preferredDevice, "选定铃声无法播放（$error${if (RingtonePermission.granted(context)) "" else "，未授予音乐和音频权限"}），改用系统默认铃声")
         }
         return null
     }
@@ -207,8 +212,6 @@ internal class AlertSoundPlayer(
             runCatching { mp.release() }
         }
         player = null
-        ringtone?.let { runCatching { it.stop() } }
-        ringtone = null
     }
 
     private fun requestFocus(attributes: AudioAttributes) {

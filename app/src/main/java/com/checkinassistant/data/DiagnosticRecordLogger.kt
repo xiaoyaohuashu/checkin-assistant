@@ -37,9 +37,13 @@ object DiagnosticRecordLogger {
         Log.i(TAG, message)
     }
 
+    /** 2.2.21：过期清理最多 10 分钟一次，别每写一行日志就删一次表。 */
+    @Volatile private var lastClearAt = 0L
+
     suspend fun geofence(context: Context, message: String) {
         Log.i(TAG, message)
-        clearExpired(context)
+        val nowMs = System.currentTimeMillis()
+        if (nowMs - lastClearAt > 10 * 60_000L) { lastClearAt = nowMs; clearExpired(context) }
         val now = System.currentTimeMillis()
         val calendar = Calendar.getInstance().apply { timeInMillis = now }
         AppDatabase.get(context.applicationContext).recordDao().insert(

@@ -221,6 +221,7 @@ class SettingsFragment : Fragment() {
                 .putString("ringtone_uri", uri?.toString().orEmpty()).apply()
             val name = uri?.let { android.media.RingtoneManager.getRingtone(requireContext(), it)?.getTitle(requireContext()) } ?: "静音"
             Toast.makeText(requireContext(), "已设置提醒铃声：$name", Toast.LENGTH_SHORT).show()
+            (activity as? com.checkinassistant.MainActivity)?.askRingtonePermissionIfNeeded(force = true)
         }
     }
 
