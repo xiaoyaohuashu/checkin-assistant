@@ -7,7 +7,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
-@Database(entities = [CheckInPoint::class, CheckInRecord::class, ReminderState::class, PointEnabledEvent::class, PointSkipEvent::class, DayNote::class], version = 9, exportSchema = false)
+@Database(entities = [CheckInPoint::class, CheckInRecord::class, ReminderState::class, PointEnabledEvent::class, PointSkipEvent::class, DayNote::class], version = 10, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun checkInPointDao(): CheckInPointDao
     abstract fun recordDao(): RecordDao
@@ -22,7 +22,7 @@ abstract class AppDatabase : RoomDatabase() {
         fun get(context: Context): AppDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(
                 context.applicationContext, AppDatabase::class.java, "checkin-assistant.db"
-            ).addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9).build().also { instance = it }
+            ).addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10).build().also { instance = it }
         }
 
         private val MIGRATION_4_5 = object : Migration(4, 5) {
@@ -82,6 +82,13 @@ abstract class AppDatabase : RoomDatabase() {
                         "`updatedAt` INTEGER NOT NULL, " +
                         "PRIMARY KEY(`date`))"
                 )
+            }
+        }
+
+        /** v2.2.22: 记录表加 simulated 列，模拟提醒不计入每日触发上限。旧记录一律当作真实触发。 */
+        private val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("ALTER TABLE check_in_records ADD COLUMN simulated INTEGER NOT NULL DEFAULT 0")
             }
         }
     }

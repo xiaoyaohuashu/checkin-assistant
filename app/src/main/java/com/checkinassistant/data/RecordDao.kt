@@ -26,7 +26,8 @@ interface RecordDao {
     suspend fun getByStatus(status: String): List<CheckInRecord>
     @Query("DELETE FROM check_in_records WHERE status = :status AND triggeredAt < :before")
     suspend fun deleteByStatusBefore(status: String, before: Long): Int
-    @Query("SELECT COUNT(*) FROM check_in_records WHERE pointId = :pointId AND year = :year AND month = :month AND day = :day")
+    // v2.2.22：模拟提醒不算数。11-10 早上测试时模拟了一次「宿舍」，晚上到家被当成「今日已触发 1/1 次」忽略。
+    @Query("SELECT COUNT(*) FROM check_in_records WHERE pointId = :pointId AND year = :year AND month = :month AND day = :day AND simulated = 0")
     suspend fun triggeredCountForDay(pointId: Long, year: Int, month: Int, day: Int): Int
 }
 

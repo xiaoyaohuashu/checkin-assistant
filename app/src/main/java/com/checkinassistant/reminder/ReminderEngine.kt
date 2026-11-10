@@ -138,7 +138,7 @@ object ReminderEngine {
                 db(context).checkInPointDao().update(point.copy(triggerState = PointState.IGNORED.name, enteredAt = null))
                 DiagnosticRecordLogger.geofence(
                     context,
-                    "LOCATION_CONFIRM_IGNORED_DAILY_LIMIT：#${point.id} ${point.name} 今日已触发 ${count}/${limit} 次，已忽略"
+                    "LOCATION_CONFIRM_IGNORED_DAILY_LIMIT：#${point.id} ${point.name} 今日已触发 ${count}/${limit} 次（不含模拟提醒），已忽略"
                 )
                 return
             }
@@ -164,7 +164,7 @@ object ReminderEngine {
         }
         val now = System.currentTimeMillis()
         if (db(context).reminderDao().get(pointId)?.let { it.active && !it.simulated } == true) return
-        val recordId = db(context).recordDao().insert(newRecord(point, now))
+        val recordId = db(context).recordDao().insert(newRecord(point, now).copy(simulated = true))
         db(context).reminderDao().upsert(ReminderState(pointId, recordId, now, 0, simulated = true))
         sendNext(context, pointId)
     }
