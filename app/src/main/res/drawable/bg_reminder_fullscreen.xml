@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- v2.2.28：到达提醒全屏页背景，上深蓝下灰蓝 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <gradient
+        android:angle="270"
+        android:startColor="#0F1F47"
+        android:endColor="#6B7689"
+        android:type="linear" />
+</shape>

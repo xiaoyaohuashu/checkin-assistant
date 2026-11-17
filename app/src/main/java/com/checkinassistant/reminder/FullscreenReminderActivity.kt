@@ -3,15 +3,19 @@ package com.checkinassistant.reminder
 import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color
 import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
-import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import com.checkinassistant.R
 import com.checkinassistant.data.AppDatabase
 import com.checkinassistant.data.CheckInPoint
 import com.checkinassistant.data.DiagnosticRecordLogger
@@ -39,6 +43,14 @@ class FullscreenReminderActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         pointId = intent.getLongExtra(ReminderEngine.EXTRA_POINT_ID, -1L)
 
+        // v2.2.28：真正全屏——内容画到系统栏和刘海区域下面，系统栏隐藏，从边缘滑动可临时呼出。
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        window.statusBarColor = Color.TRANSPARENT
+        window.navigationBarColor = Color.TRANSPARENT
+        window.attributes = window.attributes.apply {
+            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+
         // Show over the lock screen and keep the screen on (spec §2.3).
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
@@ -58,53 +70,38 @@ class FullscreenReminderActivity : AppCompatActivity() {
         val point = intent.getStringExtra(EXTRA_POINT_NAME).orEmpty()
         val count = intent.getIntExtra(EXTRA_ROUND, 1)
 
-        val root = android.widget.LinearLayout(this).apply {
-            orientation = android.widget.LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(48, 48, 48, 48)
-            setBackgroundColor(0xFF101418.toInt())
-        }
-        val title = TextView(this).apply {
-            text = "到达${point.ifEmpty { "提醒点" }}，请确认"
-            textSize = 26f; setTextColor(0xFFFFFFFF.toInt()); gravity = Gravity.CENTER
-        }
-        val subtitle = TextView(this).apply {
-            text = "提醒 $count/${ReminderEngine.MAX_REMINDERS}"
-            textSize = 14f; setTextColor(0xFF9AA3AD.toInt()); gravity = Gravity.CENTER
-            setPadding(0, 24, 0, 64)
-        }
-        val arrive = Button(this).apply {
-            text = "我已到达"; textSize = 18f
-            setTextColor(0xFFFFFFFF.toInt())
-            background = android.graphics.drawable.GradientDrawable().apply {
-                cornerRadius = 48f; setColor(0xFF2563EB.toInt())
-            }
-            setOnClickListener { confirm() }
-        }
-        val snooze = Button(this).apply {
-            text = "稍后提醒"; textSize = 16f
-            setTextColor(0xFFCBD3DC.toInt())
-            background = android.graphics.drawable.GradientDrawable().apply {
-                cornerRadius = 48f; setColor(0x22FFFFFF)
-            }
-            setOnClickListener { close() }
-        }
-        root.addView(title)
-        root.addView(subtitle, android.widget.LinearLayout.LayoutParams(
-            android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
-        root.addView(arrive, android.widget.LinearLayout.LayoutParams(
-            android.view.ViewGroup.LayoutParams.MATCH_PARENT, dp(56)
-        ).apply { setMargins(0, 0, 0, dp(16)) })
-        root.addView(snooze, android.widget.LinearLayout.LayoutParams(
-            android.view.ViewGroup.LayoutParams.MATCH_PARENT, dp(48)
-        ))
-        setContentView(root)
+        // v2.2.28：界面改为 XML 布局（只改外观），两个按钮仍分别调用 confirm() / close()。
+        setContentView(R.layout.activity_fullscreen_reminder)
+        findViewById<TextView>(R.id.reminder_title).text =
+            getString(R.string.reminder_title, point.ifEmpty { getString(R.string.reminder_default_point) })
+        findViewById<TextView>(R.id.reminder_subtitle).text =
+            getString(R.string.reminder_subtitle, count, ReminderEngine.MAX_REMINDERS)
+        findViewById<Button>(R.id.reminder_arrive).setOnClickListener { confirm() }
+        findViewById<Button>(R.id.reminder_snooze).setOnClickListener { close() }
+        hideSystemBars()
 
         // The engine's startAlert loop is already running for this point (the
         // notification path starts it); nothing extra to launch here.
         CoroutineScope(Dispatchers.IO).launch {
             DiagnosticRecordLogger.geofence(this@FullscreenReminderActivity, "FULLSCREEN_SHOWN：#$pointId $point round=$count")
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        hideSystemBars()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemBars()
+    }
+
+    /** v2.2.28：隐藏状态栏和导航栏；用户从边缘滑动时临时显示，过一会儿自动收起。 */
+    private fun hideSystemBars() {
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            hide(WindowInsetsCompat.Type.systemBars())
         }
     }
 
@@ -127,8 +124,6 @@ class FullscreenReminderActivity : AppCompatActivity() {
         }
         finish()
     }
-
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     companion object {
         const val EXTRA_POINT_NAME = "point_name"

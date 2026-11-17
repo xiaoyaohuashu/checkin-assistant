@@ -9,22 +9,27 @@ import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import androidx.core.app.NotificationCompat
-import com.checkinassistant.AlarmClockScheduler
+import com.checkinassistant.system.AlarmClockScheduler
 import com.checkinassistant.data.*
-import com.google.android.gms.location.LocationServices
-import com.google.android.gms.location.Priority
-import com.google.android.gms.tasks.CancellationTokenSource
+import com.checkinassistant.domain.ArrivalRules
+import com.checkinassistant.domain.PointRules
+import com.checkinassistant.domain.ReminderRules
+import com.checkinassistant.domain.isMinuteInWindow
+import com.checkinassistant.location.LocationProviders
 import kotlinx.coroutines.*
-import kotlinx.coroutines.tasks.await
 import java.util.Calendar
 
 object ReminderEngine {
-    private const val ACTION_ALARM = "com.checkinassistant.REMINDER_ALARM"
-    private const val ACTION_STOP_ALERT = "com.checkinassistant.STOP_REMINDER_ALERT"
-    private const val ACTION_LOCATION_CONFIRM = "com.checkinassistant.LOCATION_CONFIRM"
     private const val PREFERENCES_NAME = "reminder_settings"
     private const val KEY_RINGTONE_URI = "ringtone_uri"
-    private const val REMINDER_INTERVAL_MS = 30_000L
+    /** 点「稍后提醒」后隔多久重新提醒：10 分钟。 */
+    private const val SNOOZE_DELAY_MS = 600_000L
+    /** 手机重启 / App 升级后，没响完的提醒隔多久接着响：2 秒。 */
+    private const val RESTORE_RESUME_DELAY_MS = 2_000L
+    /** 振动节奏：振 0.45 秒、停 0.18 秒，从头循环。 */
+    private const val VIBRATE_ON_MS = 450L
+    private const val VIBRATE_PAUSE_MS = 180L
+    private const val VIBRATE_REPEAT_FROM_INDEX = 0
     /** 进入围栏后多久做一次定位复核。前台轮询复用同一常量作为兜底复核的判据。 */
     internal const val LOCATION_CONFIRM_DELAY_MS = 25_000L
     private const val LOCATION_QUERY_TIMEOUT_MS = 15_000L
@@ -37,7 +42,7 @@ object ReminderEngine {
      * 「墙钟被校正导致看起来晚了」。
      */
     const val EXTRA_SET_ELAPSED = "set_elapsed"
-    const val MAX_REMINDERS = 3
+    const val MAX_REMINDERS = ReminderRules.MAX_REMINDERS
     private fun db(context: Context) = AppDatabase.get(context)
 
     // One process-wide alert session prevents overlapping vibrator/ringtone sources.
@@ -78,6 +83,12 @@ object ReminderEngine {
             cancel(context, pointId); db(context).reminderDao().deactivate(pointId)
             return
         }
+        // v2.2.24（问题 1）：停止前刚进入范围、25 秒确认还没到就点了「停止后台监测」——到点后不提醒，状态放回「等待进入」。
+        if (com.checkinassistant.geofence.MonitorKeeper.userStopped(context)) {
+            db(context).checkInPointDao().rearmIfEntered(pointId)
+            DiagnosticRecordLogger.geofence(context, "LOCATION_CONFIRM_STOPPED：#${point.id} ${point.name} 用户已手动停止监测，不触发提醒并重新设防")
+            return
+        }
         if (point.triggerState != PointState.ENTERED.name) {
             DiagnosticRecordLogger.geofence(context, "LOCATION_CONFIRM_CANCELLED：#${point.id} ${point.name} 当前状态=${point.triggerState}")
             return
@@ -89,9 +100,7 @@ object ReminderEngine {
             DiagnosticRecordLogger.geofence(context, "LOCATION_CONFIRM_QUERY：#${point.id} ${point.name} 请求 FusedLocationProviderClient.getCurrentLocation()，最长等待 ${LOCATION_QUERY_TIMEOUT_MS / 1000}s")
             val queried = try {
                 withTimeout(LOCATION_QUERY_TIMEOUT_MS) {
-                    LocationServices.getFusedLocationProviderClient(context)
-                        .getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, CancellationTokenSource().token)
-                        .await()
+                    LocationProviders.get(context).currentLocationHighAccuracy()
                 }
             } catch (_: TimeoutCancellationException) {
                 DiagnosticRecordLogger.geofence(context, "LOCATION_CONFIRM_LOCATION_TIMEOUT：${LOCATION_QUERY_TIMEOUT_MS / 1000}s 内未取得定位，未触发提醒")
@@ -109,7 +118,7 @@ object ReminderEngine {
         val results = FloatArray(1)
         android.location.Location.distanceBetween(point.latitude, point.longitude, location.latitude, location.longitude, results)
         val distance = results[0]
-        if (distance > point.radiusMeters) {
+        if (ArrivalRules.isOutsideForConfirm(distance, point.radiusMeters)) {
             db(context).checkInPointDao().update(point.copy(triggerState = PointState.ARMED.name, enteredAt = null))
             DiagnosticRecordLogger.geofence(
                 context,
@@ -117,6 +126,7 @@ object ReminderEngine {
             )
             return
         }
+// 下面三道关（时间段、每日上限）用的都是「进入范围那一刻」的时间，不是现在（25 秒之后）的时间。
         // The time window applies to when Android delivered ENTER, rather than 25 seconds
         // later when the confirmation alarm happens to run.
         val now = Calendar.getInstance().apply { timeInMillis = point.enteredAt ?: System.currentTimeMillis() }
@@ -134,7 +144,7 @@ object ReminderEngine {
             val count = db(context).recordDao().triggeredCountForDay(
                 point.id, now.get(Calendar.YEAR), now.get(Calendar.MONTH) + 1, now.get(Calendar.DAY_OF_MONTH)
             )
-            if (count >= limit) {
+            if (ReminderRules.isDailyLimitReached(count, limit)) {
                 db(context).checkInPointDao().update(point.copy(triggerState = PointState.IGNORED.name, enteredAt = null))
                 DiagnosticRecordLogger.geofence(
                     context,
@@ -147,6 +157,11 @@ object ReminderEngine {
             context,
             "LOCATION_CONFIRM_INSIDE：#${point.id} ${point.name} distance=${"%.1f".format(distance)}m ≤ radius=${point.radiusMeters}m，accuracy=${"%.1f".format(location.accuracy)}m；立即触发提醒"
         )
+// 【顺序和所用的数据都不能动】写「本时间段已提醒」标记 → 插历史记录 → 写提醒状态 → 把点位标成「提醒中」→ 发第 1 轮。
+// 注意第 4 步用的是函数开头读出来的旧 point，整条写回会把第 1 步刚写的标记盖掉（现状）。
+// 这看着像疏漏，但不是待修的问题，不能「顺手修」：「提醒中 / 三轮没理的点仍在轮询、离开范围能被发现、
+// 再进入能通过 isActiveNow」都靠它成立。问题 15（三轮没理后重复提醒）v2.2.24 已改由收尾时把状态记成「已忽略」解决。
+// （下一行英文注释里「ONCE points flip to COMPLETED here」是旧说法：现在一次性点要等点了「已到达」或三轮响完才标完成。）
         val recordAt = System.currentTimeMillis()
         // Spec §4.6: persist window dedup marker; ONCE points flip to COMPLETED here.
         PointRules.onTriggered(point, recordAt).let { db(context).checkInPointDao().update(it) }
@@ -171,19 +186,22 @@ object ReminderEngine {
 
     suspend fun sendNext(context: Context, pointId: Long) {
         val state = db(context).reminderDao().get(pointId) ?: return
-        if (!state.active || state.reminderCount >= MAX_REMINDERS) { db(context).reminderDao().deactivate(pointId); return }
-        val point = db(context).checkInPointDao().get(pointId) ?: return
+        val step = ReminderRules.nextStep(state.active, state.reminderCount)
+        if (step == ReminderRules.Step.STOP) { db(context).reminderDao().deactivate(pointId); return }
+        val point = db(context).checkInPointDao().get(pointId)
+        if (point == null) {
+            // v2.2.24（问题 22）兜底：提醒点已经被删了，但它的闹钟抢在取消之前响了。把残留的收干净，不再响。
+            cancel(context, pointId); db(context).reminderDao().deactivate(pointId); dismissNotifications(context, pointId)
+            DiagnosticRecordLogger.geofence(context, "REMINDER_POINT_MISSING：#$pointId 提醒点已不存在，停止提醒并清掉通知")
+            return
+        }
         if (!point.enabled) {
             DiagnosticRecordLogger.geofence(context, "REMINDER_DISABLED：#${point.id} ${point.name} 已禁用，停止后续提醒")
             cancel(context, pointId); db(context).reminderDao().deactivate(pointId)
             return
         }
-        val count = state.reminderCount + 1
-        showNotification(context, point, count)
-        db(context).reminderDao().upsert(state.copy(reminderCount = count))
-        db(context).recordDao().get(state.recordId)?.let { db(context).recordDao().update(it.copy(reminderCount = count)) }
-        if (count < MAX_REMINDERS) schedule(context, pointId, System.currentTimeMillis() + REMINDER_INTERVAL_MS)
-        else {
+        if (step == ReminderRules.Step.WRAP_UP) {
+// 三轮都响满了：收尾。通知故意留在通知栏不清。
             // Max rounds reached: wrap up the session for ALL modes. Without this the
             // point used to stay REMINDING forever — the polling loop kept running with
             // nobody left to answer the notification ("仅一次提醒挂起" bug).
@@ -196,12 +214,13 @@ object ReminderEngine {
                         // stands but the user never responded — acknowledged=false,
                         // list renders "已到达，未确认" (record goes to IGNORED below).
                         val done = PointRules.onArrivedConfirmed(point, System.currentTimeMillis(), acknowledged = false)
-                            .copy(triggerState = PointState.COMPLETED.name)
+                            .copy(triggerState = ReminderRules.stateAfterRoundsExhausted(point.repeatMode).name)
                         db(context).checkInPointDao().update(done)
                     }
                     else -> {
-                        // DAILY/WEEKLY stay enabled — just re-arm for the next window.
-                        db(context).checkInPointDao().update(point.copy(triggerState = PointState.ARMED.name, enteredAt = null))
+                        // v2.2.24（问题 15）每天 / 按星期的点保持启用，但三轮没理后本时间段内不再提醒：
+                        // 状态记成「已忽略」，离开范围后才重新设防（见 ReminderRules.stateAfterRoundsExhausted）。
+                        db(context).checkInPointDao().update(point.copy(triggerState = ReminderRules.stateAfterRoundsExhausted(point.repeatMode).name, enteredAt = null))
                     }
                 }
             }
@@ -211,12 +230,22 @@ object ReminderEngine {
                 }
             }
             DiagnosticRecordLogger.geofence(context, "REMINDER_MAX_ROUNDS_REACHED：#${point.id} ${point.name} 第${MAX_REMINDERS}轮通知完毕，自动结束本次提醒会话（cancel+deactivate，mode=${point.repeatMode}）")
+            return
         }
+// 先发通知（里面会开始响铃振动），再把轮数写库。
+        val count = state.reminderCount + 1
+        showNotification(context, point, count)
+        db(context).reminderDao().upsert(state.copy(reminderCount = count))
+        db(context).recordDao().get(state.recordId)?.let { db(context).recordDao().update(it.copy(reminderCount = count)) }
+// v2.2.24（问题 6）第 3 轮也响满 30 秒：每一轮发完都排 30 秒后的闹钟（包括第 3 轮），
+// 那次闹钟到了，上面的 nextStep 才走到「收尾」，停铃声和振动。三轮合计约 90 秒。
+        schedule(context, pointId, System.currentTimeMillis() + ReminderRules.delayAfterRoundMs(count))
     }
 
     suspend fun complete(context: Context, pointId: Long) = finish(context, pointId, RecordStatus.COMPLETED)
     suspend fun ignore(context: Context, pointId: Long) = finish(context, pointId, RecordStatus.IGNORED)
     private suspend fun finish(context: Context, pointId: Long, status: RecordStatus) {
+// 这次提醒已经不存在（状态查不到）就直接返回，连 cancel 都不做——两句写在同一行是有意的，保持。
         val state = db(context).reminderDao().get(pointId) ?: return; cancel(context, pointId)
         // User acted on the notification — its job is done, clear it from the shade.
         dismissNotifications(context, pointId)
@@ -232,12 +261,13 @@ object ReminderEngine {
     }
     suspend fun snooze(context: Context, pointId: Long) {
         val state = db(context).reminderDao().get(pointId) ?: return; cancel(context, pointId)
-        db(context).reminderDao().upsert(state.copy(reminderCount = 0, snoozeUntil = System.currentTimeMillis() + 600_000L, active = true))
-        if (!state.simulated) db(context).checkInPointDao().get(pointId)?.let { db(context).checkInPointDao().update(it.copy(triggerState = PointState.SNOOZED.name)) }; schedule(context, pointId, System.currentTimeMillis() + 600_000L)
+// 稍后提醒：轮数清零（10 分钟后重新从第 1 轮开始）。下面两处「现在 + 10 分钟」各读一次时钟，是现状，不要合并成一个变量。
+        db(context).reminderDao().upsert(state.copy(reminderCount = 0, snoozeUntil = System.currentTimeMillis() + SNOOZE_DELAY_MS, active = true))
+        if (!state.simulated) db(context).checkInPointDao().get(pointId)?.let { db(context).checkInPointDao().update(it.copy(triggerState = PointState.SNOOZED.name)) }; schedule(context, pointId, System.currentTimeMillis() + SNOOZE_DELAY_MS)
     }
     suspend fun onAlarm(context: Context, pointId: Long, action: String?, expectedAt: Long = -1L) {
-        if (action == ACTION_STOP_ALERT) { stopAlert(context, pointId); return }
-        if (action == ACTION_LOCATION_CONFIRM) {
+        if (action == ReminderAlarms.ACTION_STOP_ALERT) { stopAlert(context, pointId); return }
+        if (action == ReminderAlarms.ACTION_LOCATION_CONFIRM) {
             confirmLocation(context, pointId, expectedAt, null, "ALARM")
         } else {
             sendNext(context, pointId)
@@ -273,7 +303,7 @@ object ReminderEngine {
         val setBeforeWall = System.currentTimeMillis()
         val setBeforeElapsed = android.os.SystemClock.elapsedRealtime()
         val expectedAt = setBeforeWall + LOCATION_CONFIRM_DELAY_MS
-        val intent = locationConfirmationIntent(context, id, expectedAt, setBeforeElapsed)
+        val intent = ReminderAlarms.locationConfirmationIntent(context, id, expectedAt, setBeforeElapsed)
         DiagnosticRecordLogger.geofence(
             context,
             "ALARM_SET_BEFORE：pointId=$id，now(wall)=$setBeforeWall，now(elapsed)=$setBeforeElapsed，" +
@@ -317,11 +347,11 @@ object ReminderEngine {
                 "排程后剩余=${triggerAt - afterWall}ms（应≈${LOCATION_CONFIRM_DELAY_MS}ms）"
         )
     }
-    fun schedule(context: Context, id: Long, at: Long) { val alarm = context.getSystemService(AlarmManager::class.java); alarm.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, alarmIntent(context, id)) }
-    private fun scheduleAlertStop(context: Context, id: Long, at: Long) { context.getSystemService(AlarmManager::class.java).setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, stopAlertIntent(context, id)) }
+// 提醒轮次和「稍后提醒」用的是 setAndAllowWhileIdle；25 秒定位复核才优先用 setAlarmClock（v2.2.11 真机验证）。两者不要「统一」。
+    fun schedule(context: Context, id: Long, at: Long) { ReminderAlarms.schedule(context, id, at) }
+// 先取消三条闹钟，再停响铃振动。
     fun cancel(context: Context, id: Long) {
-        val alarm = context.getSystemService(AlarmManager::class.java)
-        alarm.cancel(alarmIntent(context, id)); alarm.cancel(stopAlertIntent(context, id)); alarm.cancel(locationConfirmationIntent(context, id, 0))
+        ReminderAlarms.cancelAlarms(context, id)
         stopAlert(context, id)
         // v5+: notifications are NOT dismissed here on purpose — after a max-rounds
         // wrap-up the user should still see the reminder history in the shade.
@@ -330,9 +360,7 @@ object ReminderEngine {
 
     /** Removes the point's notifications from the shade — only for user-driven paths. */
     fun dismissNotifications(context: Context, id: Long) {
-        val manager = context.getSystemService(NotificationManager::class.java)
-        manager.cancel(id.toInt())
-        manager.cancel(ALERT_NOTIFICATION_TAG, id.toInt())
+        ReminderNotifier.dismiss(context, id)
     }
     /** A point disabled before a reboot must not start ringing again on boot. */
     fun restore(context: Context) { CoroutineScope(Dispatchers.IO).launch {
@@ -343,52 +371,23 @@ object ReminderEngine {
                 db(context).reminderDao().deactivate(it.pointId)
                 return@forEach
             }
-            if (it.snoozeUntil != null && it.snoozeUntil > System.currentTimeMillis()) schedule(context, it.pointId, it.snoozeUntil) else schedule(context, it.pointId, System.currentTimeMillis() + 2_000L)
+            if (it.snoozeUntil != null && it.snoozeUntil > System.currentTimeMillis()) schedule(context, it.pointId, it.snoozeUntil) else schedule(context, it.pointId, System.currentTimeMillis() + RESTORE_RESUME_DELAY_MS)
         }
     } }
-    private fun alarmIntent(context: Context, id: Long) = PendingIntent.getBroadcast(context, (id % Int.MAX_VALUE).toInt(), Intent(context, ReminderAlarmReceiver::class.java).setAction(ACTION_ALARM).putExtra(EXTRA_POINT_ID, id), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-    private fun stopAlertIntent(context: Context, id: Long) = PendingIntent.getBroadcast(context, (id % Int.MAX_VALUE).toInt(), Intent(context, ReminderAlarmReceiver::class.java).setAction(ACTION_STOP_ALERT).putExtra(EXTRA_POINT_ID, id), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-    private fun locationConfirmationIntent(
-        context: Context, id: Long, expectedAt: Long, setElapsed: Long = -1L
-    ) = PendingIntent.getBroadcast(
-        context,
-        (id % Int.MAX_VALUE).toInt(),
-        Intent(context, ReminderAlarmReceiver::class.java)
-            .setAction(ACTION_LOCATION_CONFIRM)
-            .putExtra(EXTRA_POINT_ID, id)
-            .putExtra(EXTRA_EXPECTED_AT, expectedAt)
-            .putExtra(EXTRA_SET_ELAPSED, setElapsed),
-        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-    )
     private suspend fun showNotification(context: Context, point: CheckInPoint, count: Int) {
-        val manager = context.getSystemService(NotificationManager::class.java); createChannel(manager)
-        val complete = actionPending(context, point.id, NotificationActionReceiver.ACTION_COMPLETE); val snooze = actionPending(context, point.id, NotificationActionReceiver.ACTION_SNOOZE)
-        // v4 §2: full-screen intent — alarm-style popup on the lock screen. When the
-        // USE_FULL_SCREEN_INTENT permission is missing (Android 14+ gate), the system
-        // automatically falls back to this same notification as a heads-up banner.
-        val fullscreen = PendingIntent.getActivity(
-            context,
-            ((point.id % 1_000_000) + 3_000_000).toInt(),
-            FullscreenReminderActivity.intent(context, point.id, point.name, count),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val notification = NotificationCompat.Builder(context, CHANNEL_ID).setSmallIcon(android.R.drawable.ic_dialog_info).setContentTitle("到达${point.name},请确认").setContentText("提醒 $count/$MAX_REMINDERS").setPriority(NotificationCompat.PRIORITY_HIGH).setCategory(NotificationCompat.CATEGORY_ALARM).setFullScreenIntent(fullscreen, true).setAutoCancel(false).addAction(0, "已到达", complete).addAction(0, "稍后提醒", snooze).build()
-        // A tag makes this ID independent of the foreground-service notification ID.
-        // More importantly, both POLL_ENTER and GEOFENCE_ENTER reach this exact post.
-        manager.notify(ALERT_NOTIFICATION_TAG, point.id.toInt(), notification)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val importance = manager.getNotificationChannel(CHANNEL_ID)?.importance
-            DiagnosticRecordLogger.geofence(context, "REMINDER_NOTIFICATION_POSTED：#${point.id} round=$count，channel=$CHANNEL_ID，effectiveImportance=$importance，priority=HIGH")
-        }
+        // 先发通知（ReminderNotifier 里：建渠道 → 发通知 → 写日志），再开始响铃振动。先后不能换。
+        ReminderNotifier.post(context, point, count)
         startAlert(context, point.id)
     }
+// startAlert / stopAlert 用同一把锁（@Synchronized 锁的是 ReminderEngine 这个对象），保证同一时刻只有一个点位在响。
+// 所以这两个函数和上面三个状态字段必须留在同一个对象里，不能拆到别处。
     @Synchronized private fun startAlert(context: Context, pointId: Long) {
         if (alertPointId == pointId && soundPlayer?.isPlaying == true) return
         stopAlert(context, null)
         alertPointId = pointId
         vibrator = context.getSystemService(Vibrator::class.java)?.also {
             // Repeat from index 0: 450ms vibration, 180ms pause, then indefinitely.
-            it.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 450, 180), 0))
+            it.vibrate(VibrationEffect.createWaveform(longArrayOf(0, VIBRATE_ON_MS, VIBRATE_PAUSE_MS), VIBRATE_REPEAT_FROM_INDEX))
         }
         // 声音由 App 自己播放：连蓝牙耳机只走耳机，否则外放（见 AlertSoundPlayer）。
         soundPlayer = AlertSoundPlayer(context.applicationContext, pointId, selectedRingtoneUri(context)).also {
@@ -407,27 +406,16 @@ object ReminderEngine {
             ?: return RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
         return saved.takeIf { it.isNotBlank() }?.let(Uri::parse)
     }
-    private fun createChannel(manager: NotificationManager) {
-        if (Build.VERSION.SDK_INT < 26) return
-        // 渠道本身不响不振：声音由 AlertSoundPlayer 播放，振动由 startAlert 负责。
-        manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "到达提醒", NotificationManager.IMPORTANCE_HIGH).apply { enableVibration(false); setSound(null, null) })
-        LEGACY_CHANNEL_IDS.forEach { runCatching { manager.deleteNotificationChannel(it) } }
-    }
-    private fun actionPending(context: Context, id: Long, action: String) = PendingIntent.getBroadcast(context, ((id % 1_000_000) + if (action == NotificationActionReceiver.ACTION_COMPLETE) 1_000_000 else 2_000_000).toInt(), Intent(context, NotificationActionReceiver::class.java).setAction(action).putExtra(EXTRA_POINT_ID, id), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
     private fun newRecord(point: CheckInPoint, time: Long): CheckInRecord { val c = Calendar.getInstance().apply { timeInMillis = time }; return CheckInRecord(pointId = point.id, pointName = point.name, triggeredAt = time, year = c.get(Calendar.YEAR), month = c.get(Calendar.MONTH) + 1, day = c.get(Calendar.DAY_OF_MONTH), weekday = c.get(Calendar.DAY_OF_WEEK), hour = c.get(Calendar.HOUR_OF_DAY), minute = c.get(Calendar.MINUTE), second = c.get(Calendar.SECOND)) }
+    /** 渠道 ID 的定义在 ReminderNotifier；这里保留同名常量给外面用。 */
+    const val CHANNEL_ID = ReminderNotifier.CHANNEL_ID
     private fun formatMinute(minute: Int) = "%02d:%02d".format(minute / 60, minute % 60)
-    // Notification-channel importance is immutable once Android has created it.  Use a
-    // new ID so devices that retained an older channel configuration start from HIGH.
-    // v4 (2.2.18): 声音统一由 App 播放（耳机/外放切换），渠道静音。
-    const val CHANNEL_ID = "checkin_reminders_v4"
-    private val LEGACY_CHANNEL_IDS = listOf("checkin_reminders_v3")
-    private const val ALERT_NOTIFICATION_TAG = "checkin_reminder_alert"
 }
 
 private fun CheckInPoint.isActiveAt(minuteOfDay: Int): Boolean {
     val start = activeStartMinute ?: return true
     val end = activeEndMinute ?: return true
-    return if (start < end) minuteOfDay in start until end else minuteOfDay >= start || minuteOfDay < end
+    return isMinuteInWindow(start, end, minuteOfDay)
 }
 
 private fun CheckInPoint.timeWindowText(): String = "%02d:%02d-%02d:%02d".format(

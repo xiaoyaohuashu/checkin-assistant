@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- v2.2.28：到达提醒「我已到达」浅色胶囊（按下略深） -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#D5D9E0" />
+            <corners android:radius="32dp" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#F0F2F5" />
+            <corners android:radius="32dp" />
+        </shape>
+    </item>
+</selector>

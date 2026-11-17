@@ -14,17 +14,22 @@ import android.os.SystemClock
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
-import com.checkinassistant.AlarmWakeLock
+import com.checkinassistant.system.AlarmWakeLock
 import com.checkinassistant.MainActivity
 import com.checkinassistant.data.*
-import com.checkinassistant.reminder.PointRules
+import com.checkinassistant.domain.WINDOW_WARMUP_MS
+import com.checkinassistant.domain.isActiveAtMillis
+import com.checkinassistant.domain.MonitorStartRules
+import com.checkinassistant.domain.nextMonitoringChange
+import com.checkinassistant.domain.sleepingStatusText
+import com.checkinassistant.domain.ArrivalRules
+import com.checkinassistant.location.LocationProviders
+import com.checkinassistant.location.PlayServices
+import com.checkinassistant.domain.PointRules
 import com.checkinassistant.reminder.ReminderEngine
 import com.google.android.gms.location.*
-import com.google.android.gms.tasks.CancellationTokenSource
 import kotlinx.coroutines.*
 import kotlinx.coroutines.tasks.await
-import java.time.Instant
-import java.time.ZoneId
 
 /**
  * Performs app-controlled checks only while at least one point is within its active window.
@@ -36,7 +41,7 @@ class GeofenceMonitoringService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val db by lazy { AppDatabase.get(this) }
     private val geofenceClient by lazy { LocationServices.getGeofencingClient(this) }
-    private val locationClient by lazy { LocationServices.getFusedLocationProviderClient(this) }
+    private val locationProvider by lazy { LocationProviders.get(this) }
     private var pollingJob: Job? = null
     /** 上一轮轮询开始的墙钟时间，仅用于诊断轮询实际周期。 */
     private var lastPollStartedAtMs = 0L
@@ -64,8 +69,24 @@ class GeofenceMonitoringService : Service() {
      * （[schedulePollTick]）；两轮之间不持锁、不靠协程计时，CPU 可以睡。
      */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+// 【顺序不能动】这个函数里各步的先后是真机反复试出来的（见操作日志 v2.2.12–v2.2.14 各条）：
+// 1) 先建渠道、把自己变成前台服务——Android 要求启动前台服务后几秒内必须显示通知，失败就只能退出；
+//    （v2.2.24：「用户手动停止就立刻退出」的判断必须放在这一步之后——先成为前台再退，否则系统会判违规。）
+// 2) 在开协程之前先读「到的是不是保底闹钟」，因为协程里会重新排闹钟、把这个标记改掉；
+// 3) 上一轮还没结束就不另起一轮，只放掉接收器交过来的那把锁；
+// 4) 只有「不是轮询闹钟」的启动（保存提醒点、开机、时段闹钟等）才取消正在跑的那一轮，重新评估；
+// 5) 协程里先拿自己的锁、再放交接锁——两把锁必须有重叠，中间不能有 CPU 可以睡过去的空档。
         createChannel()
         if (!showStatus(pollActiveIds != null, currentStatus.ifEmpty { "正在检查监测时段…" }, force = true)) {
+            stopSelfResult(startId)
+            return START_NOT_STICKY
+        }
+        // v2.2.24（问题 1）：用户手动停止后，不管是谁把服务叫起来的（系统重建、漏网的启动请求），立刻退出。
+        if (MonitorKeeper.userStopped(this)) {
+            releaseTickHandoff()
+            DiagnosticRecordLogger.trace("MONITOR_SERVICE_REFUSED：用户已手动停止监测，服务立即退出")
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            foregroundType = 0
             stopSelfResult(startId)
             return START_NOT_STICKY
         }
@@ -79,6 +100,7 @@ class GeofenceMonitoringService : Service() {
             if (backupFired) scope.launch { logBackupAlarmFired("上一轮开始 ${POLL_BACKUP_MS / 1000}s 后仍未结束，本次不另起一轮") }
             return START_STICKY
         }
+// 轮询闹钟（tick）绝不取消上一轮：上面已经确认上一轮不在跑了。
         if (!tick) pollingJob?.cancel()
         pollingJob = scope.launch {
             // 每一轮（或每次重新评估）自己的锁：60 秒上限，finally 里立即释放。
@@ -131,12 +153,14 @@ class GeofenceMonitoringService : Service() {
             sleepUntilNextWindow(points, "当前无生效地点", startId)
             return
         }
+// 地理围栏只是「第二条路」：真正靠的是下面的主动定位轮询。围栏在不少机型上投递很慢甚至不投递。
         registerGeofences(activePoints)
         nextMonitoringChange(points, now)?.let(::scheduleReevaluation)
             ?: cancelMonitoringReevaluation(this)
         // 省电优化：当天已完成（窗口去重/已确认）或已跳过的点不再参与主动定位轮询。
         // 过滤口径全部来自 PointRules（持久化状态），重启后依然有效。
-        val pollablePoints = activePoints.filter { com.checkinassistant.reminder.PointRules.isActiveNow(it, now) }
+// 注意：只是提醒过但没点「已到达」的点，仍然算「要盯」——提醒中离开范围能自动取消、三轮没理后离开再进入能再提醒（v2.2.24，问题 15），靠的就是它还在轮询里。
+        val pollablePoints = activePoints.filter { com.checkinassistant.domain.PointRules.isActiveNow(it, now) }
         if (pollablePoints.isEmpty()) {
             DiagnosticRecordLogger.geofence(this, "POLL_SKIP_ALL_DONE：生效时间段内的 ${activePoints.size} 个地点今日均已完成或已跳过，不启动定位轮询：${activePoints.joinToString { "#${it.id} ${it.name}" }}")
             sleepUntilNextWindow(points, "今日生效地点均已完成或已跳过", startId)
@@ -157,6 +181,7 @@ class GeofenceMonitoringService : Service() {
         schedulePollTick(this, System.currentTimeMillis() + POLL_BACKUP_MS, backup = true)
         val keepPolling = try {
             pollCycleBody(startId)
+// 协程被取消（新的启动请求顶替了这一轮）必须原样抛出去，不能当成普通错误吞掉后继续排闹钟。
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
@@ -164,6 +189,9 @@ class GeofenceMonitoringService : Service() {
             true
         }
         if (!keepPolling) return
+// 下一轮和上面的保底闹钟共用同一个 PendingIntent（编号 1003）：这里再排一次就把保底的覆盖掉了。
+// 不能为了「看着清楚」拆成两个闹钟——那样两个都会响，轮询会翻倍。
+// 也不能换成协程 delay / Handler 计时：锁屏后 CPU 会睡，计时就停了（v2.2.12 之前就是这么丢提醒的）。
         val at = System.currentTimeMillis() + POLL_INTERVAL_MS
         val exact = schedulePollTick(this, at)
         if (exact != lastTickExact) {
@@ -205,7 +233,7 @@ class GeofenceMonitoringService : Service() {
         }
         // 省电优化：每轮重新评估可轮询集合。当天完成（窗口去重/已确认）或已跳过
         // 的点立即退出轮询；其余点继续。判定全部来自 PointRules 的持久化状态。
-        val currentPollable = currentPoints.filter { com.checkinassistant.reminder.PointRules.isActiveNow(it, now) }
+        val currentPollable = currentPoints.filter { com.checkinassistant.domain.PointRules.isActiveNow(it, now) }
         val currentPollableIds = currentPollable.map { it.id }
         val dropped = pollableIds.toSet() - currentPollableIds.toSet()
         if (dropped.isNotEmpty()) {
@@ -216,6 +244,7 @@ class GeofenceMonitoringService : Service() {
             }
         }
         pollableIds = currentPollableIds
+// 这里比的是有先后顺序的列表（不是集合）。按现状保留，不要改成集合比较。
         if (currentIds != activeIds) {
             activeIds = currentIds
             registerGeofences(currentPoints)
@@ -224,6 +253,7 @@ class GeofenceMonitoringService : Service() {
         if (currentPollable.isEmpty()) {
             DiagnosticRecordLogger.geofence(this, "POLL_STOP_ALL_DONE：当前生效时间段的地点今日均已完成或已跳过，停止定位轮询")
             // 围栏保留给下一个生效时间段重建；这里仅停轮询并安排下一次窗口唤醒。
+// （重构时发现：上面这句旧注释说「围栏保留」，但下一行代码实际是移除围栏。按代码现状保留，见待处理问题 17。）
             removeGeofences("今日生效地点均已完成或已跳过")
             sleepUntilNextWindow(points, "今日生效地点均已完成或已跳过", startId)
             return false
@@ -241,6 +271,7 @@ class GeofenceMonitoringService : Service() {
         val cycleMs = if (lastPollStartedAtMs > 0L) requestedAt - lastPollStartedAtMs else -1L
         lastPollStartedAtMs = requestedAt
         PollWatchdog.markCycle(this, requestedAt)
+// 先记下「这一轮开始了」再去取定位：取定位最长要等 15 秒，中途进程被杀，看门狗也能知道最后一轮是什么时候。
         // 诊断：记录轮询实际周期。周期 = POLL_INTERVAL_MS + 上一轮 pollOnce 耗时，
         // 兜底复核的延迟上界就是这个周期 —— 用于核对「固定 ~18.76s」是否来自轮询节拍。
         DiagnosticRecordLogger.geofence(
@@ -249,8 +280,9 @@ class GeofenceMonitoringService : Service() {
                 "距上一轮开始=${cycleMs}ms（POLL_INTERVAL_MS=$POLL_INTERVAL_MS + 上一轮耗时）"
         )
         val location = try {
+// 15 秒超时只包「取定位」这一句。超时后本轮直接结束，等下一轮；不重试，避免两轮叠在一起。
             withTimeout(LOCATION_QUERY_TIMEOUT_MS) {
-                locationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, CancellationTokenSource().token).await()
+                locationProvider.currentLocationHighAccuracy()
             }
         } catch (_: TimeoutCancellationException) {
             DiagnosticRecordLogger.geofence(this, "POLL_LOCATION_TIMEOUT：${LOCATION_QUERY_TIMEOUT_MS / 1000}s 内未取得当前位置，本轮不触发提醒")
@@ -267,7 +299,7 @@ class GeofenceMonitoringService : Service() {
         // accuracy 50-98 m, which armed confirmations that the 25 s re-check then
         // aborted ("设好了没响"). A fix this coarse cannot decide INSIDE/OUTSIDE
         // against a 200 m radius, so discard it and wait for the next poll.
-        if (location.accuracy > POLL_MAX_ACCURACY_M) {
+        if (ArrivalRules.isTooInaccurate(location.accuracy)) {
             DiagnosticRecordLogger.geofence(this, "POLL_LOCATION_INACCURATE：accuracy=${"%.1f".format(location.accuracy)}m > ${POLL_MAX_ACCURACY_M.toInt()}m，丢弃本轮定位，避免误进/误出判定")
             return
         }
@@ -275,8 +307,9 @@ class GeofenceMonitoringService : Service() {
         val ageMs = (SystemClock.elapsedRealtimeNanos() - location.elapsedRealtimeNanos) / 1_000_000
         DiagnosticRecordLogger.geofence(this, "POLL_LOCATION_RECEIVED：耗时=${System.currentTimeMillis() - requestedAt}ms，位置年龄=${ageMs}ms，accuracy=${"%.1f".format(location.accuracy)}m；" + distances.entries.joinToString("；") { (point, distance) -> "#${point.id} ${point.name} distance=${"%.1f".format(distance)}m/radius=${point.radiusMeters}m" })
         distances.forEach { (point, distance) ->
-            if (distance <= point.radiusMeters) {
+            if (ArrivalRules.isInsideForPoll(distance, point.radiusMeters)) {
                 val confirmAt = point.enteredAt?.let { it + ReminderEngine.LOCATION_CONFIRM_DELAY_MS }
+// 【不要抽成函数 / 不要把时钟提成变量】这个条件靠「&&」短路：前两项成立才去读时钟；下面几处也是各读各的。
                 if (point.triggerState == PointState.ENTERED.name && confirmAt != null && System.currentTimeMillis() >= confirmAt) {
                     // 兜底复核：25 秒确认闹钟在 Doze / 未豁免电池优化时会被系统延后
                     // （历史上晚 18.8s 与约 3m34s）。而 enter() 对已处于 ENTERED 的点会
@@ -299,6 +332,8 @@ class GeofenceMonitoringService : Service() {
     private fun distanceMeters(point: CheckInPoint, location: Location): Float = FloatArray(1).also { Location.distanceBetween(point.latitude, point.longitude, location.latitude, location.longitude, it) }[0]
 
     private suspend fun sleepUntilNextWindow(points: List<CheckInPoint>, reason: String, startId: Int) {
+// 【顺序不能动】清状态 → 取消轮询闹钟 → 告诉看门狗「现在不该在跑」→ 排（或取消）下一次时段闹钟 → 没有提醒点才停服务。
+// 先告诉看门狗再排闹钟：反过来的话，中间被别的唤醒插进来，看门狗会以为轮询断了又把它拉起来。
         pollingJob = null
         // 轮询到此为止：清掉轮询状态、取消还没到的轮询闹钟，并告诉看门狗「现在不该在跑」。
         pollActiveIds = null
@@ -307,12 +342,14 @@ class GeofenceMonitoringService : Service() {
         PollWatchdog.markExpected(this, false)
         val now = System.currentTimeMillis()
         val nextChange = nextMonitoringChange(points, now)
+// 算不出下一次唤醒时间 = 没有任何点在等下一个时刻，这里不排闹钟。
+// v2.2.24（问题 16）：没在盯的全天点现在也会算出「下一个生效日 0 点」，不会再落到这里。
         if (nextChange == null) {
             cancelMonitoringReevaluation(this)
-            DiagnosticRecordLogger.geofence(this, "MONITOR_SLEEP_WAKEUP：没有已启用的分时段地点，已取消时段唤醒闹钟")
+            DiagnosticRecordLogger.geofence(this, "MONITOR_SLEEP_WAKEUP：没有需要等待的下一个监测时刻，已取消时段唤醒闹钟")
         } else {
             val exact = scheduleMonitoringReevaluation(this, nextChange)
-            DiagnosticRecordLogger.geofence(this, "MONITOR_SLEEP_WAKEUP：已安排${if (exact) "精确（setAlarmClock）" else "非精确"}唤醒，时间=$nextChange（分时段开始前 ${WINDOW_WARMUP_MS / 60_000}min 或状态边界）")
+            DiagnosticRecordLogger.geofence(this, "MONITOR_SLEEP_WAKEUP：已安排${if (exact) "精确（setAlarmClock）" else "非精确"}唤醒，时间=$nextChange（分时段开始前 ${WINDOW_WARMUP_MS / 60_000}min、状态边界，或全天点下一个生效日 0 点）")
         }
         if (points.isEmpty()) {
             DiagnosticRecordLogger.geofence(this, "MONITOR_SLEEP：$reason；没有已启用的地点，停止前台服务")
@@ -320,6 +357,7 @@ class GeofenceMonitoringService : Service() {
             foregroundType = 0
             // A wakeup or a point edit may have started this service again while this older
             // coroutine was cleaning up.  Never stop that newer start request.
+// 必须用带 startId 的 stopSelfResult，不能用 stopSelf()：见上面英文注释，不能把更新的启动请求一起停掉。
             stopSelfResult(startId)
             return
         }
@@ -331,21 +369,7 @@ class GeofenceMonitoringService : Service() {
 
     private fun monitoringText(points: List<CheckInPoint>) = "监测中 · ${points.joinToString("、") { it.name }}"
 
-    private fun sleepingText(points: List<CheckInPoint>, now: Long): String {
-        val next = points.filter { it.activeStartMinute != null && it.activeEndMinute != null }
-            .mapNotNull { PointRules.findNextActiveTime(it, now) }
-            .minOrNull() ?: return "休眠中 · 暂无待监测的时段"
-        val zone = ZoneId.systemDefault()
-        val at = Instant.ofEpochMilli(next).atZone(zone)
-        val today = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
-        val time = "%02d:%02d".format(at.hour, at.minute)
-        val day = when (at.toLocalDate()) {
-            today -> time
-            today.plusDays(1) -> "明天 $time"
-            else -> "${at.monthValue}月${at.dayOfMonth}日 $time"
-        }
-        return "休眠中 · 下次 $day 开始监测"
-    }
+    private fun sleepingText(points: List<CheckInPoint>, now: Long): String = sleepingStatusText(points, now)
 
     /**
      * 更新常驻通知。类型：Android 14+ 监测中用 location、休眠中用 specialUse（长期运行不限时）；
@@ -393,6 +417,10 @@ class GeofenceMonitoringService : Service() {
 
     @SuppressLint("MissingPermission")
     private suspend fun registerGeofences(points: List<CheckInPoint>) {
+        // v2.2.25：没有 Google Play 服务就不用地理围栏，只靠定位轮询
+        if (!PlayServices.isInstalled(this)) { DiagnosticRecordLogger.geofence(this, "REGISTER_SKIPPED_NO_GMS：没有 Google Play 服务，跳过地理围栏，只靠定位轮询"); return }
+// 围栏仍直接调用 Google（本次重构没有给围栏加接口）。
+// 先后是现状，保持：先把围栏对象建好（坐标/半径非法会在这里就抛错）→ 移除旧围栏 → 建注册请求 → 注册新围栏。
         val fences = points.map { point -> Geofence.Builder().setRequestId(point.id.toString()).setCircularRegion(point.latitude, point.longitude, point.radiusMeters.toFloat()).setExpirationDuration(Geofence.NEVER_EXPIRE).setTransitionTypes(Geofence.GEOFENCE_TRANSITION_ENTER or Geofence.GEOFENCE_TRANSITION_EXIT).build() }
         try { geofenceClient.removeGeofences(geofencePendingIntent(this)).await(); DiagnosticRecordLogger.geofence(this, "REGISTER_OLD_REMOVED：已移除旧围栏") }
         catch (error: Exception) { DiagnosticRecordLogger.geofence(this, "REGISTER_OLD_REMOVE_FAILURE：${failureDetails(error)}") }
@@ -402,6 +430,7 @@ class GeofenceMonitoringService : Service() {
     }
 
     private suspend fun removeGeofences(reason: String) {
+        if (!PlayServices.isInstalled(this)) return // v2.2.25：没有 Google Play 服务时本来就没注册围栏
         try { geofenceClient.removeGeofences(geofencePendingIntent(this)).await(); DiagnosticRecordLogger.geofence(this, "REGISTER_REMOVED：$reason") }
         catch (error: Exception) { DiagnosticRecordLogger.geofence(this, "REGISTER_REMOVE_FAILURE：$reason；${failureDetails(error)}") }
     }
@@ -481,6 +510,11 @@ class GeofenceMonitoringService : Service() {
          * @return null = 已交给服务；否则是启动前台服务时的异常（锁已释放）。
          */
         fun startPollTick(context: Context): Exception? {
+            // v2.2.24（问题 1）：用户手动停止后，漏网的轮询闹钟到点也不启动服务。
+            if (MonitorKeeper.userStopped(context)) {
+                DiagnosticRecordLogger.trace("POLL_TICK_REFUSED：用户已手动停止监测")
+                return null
+            }
             AlarmWakeLock.release(tickHandoff.getAndSet(AlarmWakeLock.acquire(context, "GeofencePollTick")))
             return try {
                 androidx.core.content.ContextCompat.startForegroundService(
@@ -493,10 +527,24 @@ class GeofenceMonitoringService : Service() {
             }
         }
         /** v5 任务四: polling fixes coarser than this are discarded (drift guard). */
-        private const val POLL_MAX_ACCURACY_M = 50f
+        private const val POLL_MAX_ACCURACY_M = ArrivalRules.POLL_MAX_ACCURACY_M
         private const val LOCATION_QUERY_TIMEOUT_MS = 15_000L
+        /** 地理围栏 PendingIntent 的编号和 action。系统按这两个值认围栏回调，不能改。 */
+        private const val REQUEST_CODE_GEOFENCE = 1001
+        private const val ACTION_GEOFENCE = "com.checkinassistant.GEOFENCE"
+        /**
+         * 请求启动（或重新评估）后台监测。除首页「启动」按钮以外的所有地方都走这里。
+         * v2.2.24（问题 1）：用户手动停止之后，这里一律不启动，也不再清「用户手动停止」标记。
+         */
         fun start(context: Context) {
-            // 任何一次启动都代表要监测，清掉「用户手动停止」。
+            if (!MonitorStartRules.mayStart(MonitorKeeper.userStopped(context), byUser = false)) {
+                DiagnosticRecordLogger.trace("MONITOR_START_REFUSED：用户已手动停止监测，本次不启动")
+                return
+            }
+            androidx.core.content.ContextCompat.startForegroundService(context, Intent(context, GeofenceMonitoringService::class.java))
+        }
+        /** 只有首页「启动后台监测」按钮调用。全工程只有这里清「用户手动停止」标记（v2.2.24，问题 1）。 */
+        fun startByUser(context: Context) {
             MonitorKeeper.setUserStopped(context, false)
             androidx.core.content.ContextCompat.startForegroundService(context, Intent(context, GeofenceMonitoringService::class.java))
         }
@@ -513,11 +561,15 @@ class GeofenceMonitoringService : Service() {
             // 用户手动停止：取消还没到的轮询闹钟，并告诉看门狗不要再把它拉起来。
             cancelPollTick(context)
             PollWatchdog.markExpected(context, false)
+            // v2.2.24（问题 1）：把还排着的时段唤醒闹钟也取消，并尽量移除被动围栏，免得它们再来叫醒。
+            // （就算没取消干净，到点后各个入口也会因为「用户手动停止」而不启动。）
+            cancelMonitoringReevaluation(context)
+            if (PlayServices.isInstalled(context)) runCatching { LocationServices.getGeofencingClient(context.applicationContext).removeGeofences(geofencePendingIntent(context)) }
             context.stopService(Intent(context, GeofenceMonitoringService::class.java))
         }
         fun geofencePendingIntent(context: Context): PendingIntent {
             val flags = PendingIntent.FLAG_UPDATE_CURRENT or if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
-            return PendingIntent.getBroadcast(context, 1001, Intent(context, GeofenceBroadcastReceiver::class.java).setAction("com.checkinassistant.GEOFENCE"), flags)
+            return PendingIntent.getBroadcast(context, REQUEST_CODE_GEOFENCE, Intent(context, GeofenceBroadcastReceiver::class.java).setAction(ACTION_GEOFENCE), flags)
         }
     }
 }

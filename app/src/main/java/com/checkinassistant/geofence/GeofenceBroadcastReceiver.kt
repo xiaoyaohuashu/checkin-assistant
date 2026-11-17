@@ -1,7 +1,7 @@
 package com.checkinassistant.geofence
 
 import android.content.*
-import com.checkinassistant.AlarmWakeLock
+import com.checkinassistant.system.AlarmWakeLock
 import com.checkinassistant.data.*
 import com.google.android.gms.location.Geofence
 import com.google.android.gms.location.GeofencingEvent

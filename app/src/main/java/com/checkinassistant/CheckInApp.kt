@@ -21,6 +21,9 @@ import kotlinx.coroutines.launch
  *
  * v2.2.14：进程启动时登记 WorkManager 兜底任务，并检查恢复前台服务和时段唤醒闹钟（[MonitorKeeper]）。
  */
+/** 进程启动后等多久再做一次保活检查：5 秒。 */
+private const val PROCESS_START_KEEPER_DELAY_MS = 5_000L
+
 class CheckInApp : Application() {
     override fun onCreate() {
         super.onCreate()
@@ -41,7 +44,7 @@ class CheckInApp : Application() {
                 DiagnosticRecordLogger.geofence(this@CheckInApp, "PROCESS_LAST_EXIT：${lastExit()}")
             }
             // 等 5 秒：让拉起进程的组件（闹钟、广播、界面）先启动服务，避免这里重复启动。
-            delay(5_000)
+            delay(PROCESS_START_KEEPER_DELAY_MS)
             try {
                 MonitorKeeper.ensure(this@CheckInApp, "PROCESS_START")
             } catch (error: Exception) {

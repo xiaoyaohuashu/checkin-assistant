@@ -3,7 +3,8 @@ package com.checkinassistant.geofence
 import android.content.Context
 import com.checkinassistant.data.AppDatabase
 import com.checkinassistant.data.DiagnosticRecordLogger
-import com.checkinassistant.reminder.PointRules
+import com.checkinassistant.domain.isActiveAtMillis
+import com.checkinassistant.domain.PointRules
 
 /**
  * 轮询看门狗（v2.2.12）。
@@ -54,6 +55,8 @@ internal object PollWatchdog {
      */
     suspend fun check(context: Context, source: String) {
         val app = context.applicationContext
+        // v2.2.24（问题 1）：用户手动停止后看门狗不重启（停止时 expected 已是 false，这里再加一道保险）。
+        if (MonitorKeeper.userStopped(app)) return
         if (!expected(app)) return
         val now = System.currentTimeMillis()
         val last = lastCycleAt(app)

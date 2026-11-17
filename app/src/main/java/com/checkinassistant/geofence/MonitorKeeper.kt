@@ -8,6 +8,7 @@ import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.checkinassistant.data.AppDatabase
 import com.checkinassistant.data.DiagnosticRecordLogger
+import com.checkinassistant.domain.nextMonitoringChange
 import java.util.concurrent.TimeUnit
 
 /**
@@ -27,7 +28,7 @@ internal object MonitorKeeper {
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
 
-    /** 用户在首页手动停止监测时为 true；兜底不会把它拉起来。任何一次启动服务都会清掉它。 */
+    /** 用户在首页手动停止监测时为 true；兜底不会把它拉起来。v2.2.24 起只有首页点「启动」才清掉它（GeofenceMonitoringService.startByUser）。 */
     fun setUserStopped(context: Context, stopped: Boolean) {
         prefs(context).edit().putBoolean(KEY_USER_STOPPED, stopped).commit()
     }

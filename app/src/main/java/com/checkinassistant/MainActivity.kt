@@ -1,8 +1,14 @@
 package com.checkinassistant
 
+import com.checkinassistant.ui.Ui
+import com.checkinassistant.ui.BottomNav
+import com.checkinassistant.ui.PointAdapter
+import com.checkinassistant.ui.TimeWheelDialog
+import com.checkinassistant.ui.AspectFrameLayout
+import com.checkinassistant.ui.tight
+import com.checkinassistant.ui.leading
 import android.app.AlertDialog
 import android.app.ActivityManager
-import android.app.TimePickerDialog
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -31,7 +37,8 @@ import com.checkinassistant.data.PointEnabledEvent
 import com.checkinassistant.data.PointSkipEvent
 import com.checkinassistant.data.RecordStatus
 import com.checkinassistant.geofence.GeofenceMonitoringService
-import com.checkinassistant.reminder.TimeWheelDialog
+import com.checkinassistant.domain.PointDefaults
+import com.checkinassistant.domain.PointRules
 import com.checkinassistant.reminder.ReminderEngine
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -42,6 +49,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var pointsList: RecyclerView
     private lateinit var monitoringText: TextView
     private lateinit var monitoringSubtitle: TextView
+    /** v2.2.26：后台定位用不了高德的原因；平时隐藏。 */
+    private lateinit var monitoringReason: TextView
     private lateinit var monitoringButton: TextView
     private lateinit var shieldIcon: ImageView
     private lateinit var shieldBox: FrameLayout
@@ -49,8 +58,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var listCount: TextView
     private lateinit var headerRow: LinearLayout
     private lateinit var navBar: BottomNav.Bar
-    private var selectedLatitude = 3.1390 // Kuala Lumpur; used until a map selection is made.
-    private var selectedLongitude = 101.6869
+    private var selectedLatitude = PointDefaults.LATITUDE // Kuala Lumpur; used until a map selection is made.
+    private var selectedLongitude = PointDefaults.LONGITUDE
     private var pendingPoint: CheckInPoint? = null
     private var pendingName = ""
     private var pendingRadius = ""
@@ -65,6 +74,8 @@ class MainActivity : AppCompatActivity() {
     /** pointId → status of its latest check-in record (badge: 已完成 vs 已到达，未确认). */
     private var latestRecordStatus: Map<Long, String> = emptyMap()
 
+    // 现在没有任何地方会打开这个铃声选择器（选铃声已搬到设置页）。保留这段注册是因为它是本页第一个
+    // 登记的「结果接收器」：系统按登记顺序给它们编号，删掉它会让后面两个（铃声权限、地图选点）的编号前移。
     private val ringtonePicker = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         val uri = result.data?.getParcelableExtra<Uri>(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
         if (result.resultCode == RESULT_OK && uri != null) {
@@ -95,7 +106,7 @@ class MainActivity : AppCompatActivity() {
             selectedLatitude = result.data?.getDoubleExtra(MapPickerActivity.EXTRA_LATITUDE, selectedLatitude) ?: selectedLatitude
             selectedLongitude = result.data?.getDoubleExtra(MapPickerActivity.EXTRA_LONGITUDE, selectedLongitude) ?: selectedLongitude
             // 选点页内调整过的触发范围写回待保存值（仍走现有 radiusMeters 字段保存）
-            result.data?.getIntExtra(MapPickerActivity.EXTRA_RADIUS, -1)?.takeIf { it in 100..500 }?.let {
+            result.data?.getIntExtra(MapPickerActivity.EXTRA_RADIUS, -1)?.takeIf { PointDefaults.isValidRadius(it) }?.let {
                 pendingRadius = it.toString()
             }
             showEditor(pendingPoint, keepSelectedCoordinates = true)
@@ -174,6 +185,14 @@ class MainActivity : AppCompatActivity() {
             com.checkinassistant.update.UpdateCheckWorker.cancelNotification(this)
         }
         com.checkinassistant.update.UpdatePrompt.check(this, manual = false, force = fromNotification)
+        // v2.2.26（中 5）：点了「需要同意高德隐私说明」的通知进来：弹隐私说明
+        if (intent?.getBooleanExtra(com.checkinassistant.map.AmapNotice.EXTRA_ASK_PRIVACY, false) == true) {
+            intent.removeExtra(com.checkinassistant.map.AmapNotice.EXTRA_ASK_PRIVACY)
+            com.checkinassistant.map.AmapNotice.cancel(this)
+            if (com.checkinassistant.map.MapSettings.amapKeyConfigured(this) &&
+                com.checkinassistant.map.MapSettings.privacy(this) != com.checkinassistant.domain.AmapPrivacy.AGREED
+            ) askAmapPrivacy()
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -246,6 +265,9 @@ class MainActivity : AppCompatActivity() {
         monitoringSubtitle = Ui.text(this, 13f, Ui.TEXT_SUB, Typeface.DEFAULT, "开启后，到达提醒点范围会自动提醒你").leading(1.625f)
         monitorTexts.addView(monitoringText)
         monitorTexts.addView(monitoringSubtitle, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(4) })
+        // v2.2.26（中 5）：后台定位想用高德却用不了时，在这里说明原因。平时不显示、不占位置。
+        monitoringReason = Ui.text(this, 13f, Ui.PRIMARY, Typeface.DEFAULT, "").leading(1.5f).apply { visibility = View.GONE }
+        monitorTexts.addView(monitoringReason, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(4) })
         monitorLeft.addView(monitorTexts, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         monitorRow.addView(
             monitorLeft,
@@ -265,7 +287,11 @@ class MainActivity : AppCompatActivity() {
             background = Ui.rounded(Ui.PRIMARY, 18, this@MainActivity)
             setOnClickListener {
                 if (monitoringRunning()) GeofenceMonitoringService.stop(this@MainActivity)
-                else GeofenceMonitoringService.start(this@MainActivity)
+                else {
+                    GeofenceMonitoringService.startByUser(this@MainActivity) // 只有这里能解除「手动停止」（v2.2.24，问题 1）
+                    // v2.2.25：没有 Google Play 服务的手机要用高德定位，第一次在这里问隐私说明（有 Google Play 服务时什么也不做）
+                    com.checkinassistant.map.AmapPrivacyPrompt.offerOnMonitorStart(this@MainActivity) { refreshMonitoringReason() }
+                }
                 refreshMonitoringStatus()
             }
         }
@@ -419,6 +445,8 @@ class MainActivity : AppCompatActivity() {
     private fun onPageChanged(tab: Int) {
         currentTab = tab
         if (::navBar.isInitialized) navBar.select(tab)
+        // v2.2.26：在设置页改了地图服务 / 撤回了隐私同意后切回来，卡片上的原因要跟着变（只刷这一行）
+        refreshMonitoringReason()
         ensurePage(tab)
     }
 
@@ -511,6 +539,43 @@ class MainActivity : AppCompatActivity() {
         monitoringButton.setTextColor(if (running) Ui.PRIMARY else Color.WHITE)
         monitoringButton.background = Ui.rounded(if (running) Ui.SHIELD_OFF_BG else Ui.PRIMARY, 18, this)
         monitoringButton.elevation = if (running) 0f else Ui.dpf(this, 2f)
+        refreshMonitoringReason()
+    }
+
+    /**
+     * v2.2.26（中 5）：监测卡片上的「后台定位为什么用不了高德」。
+     * 有 Google Play 服务、设置不是「始终高德」时一定不显示（和 v2.2.24 的卡片一样）。
+     */
+    private fun refreshMonitoringReason() {
+        if (!::monitoringReason.isInitialized) return
+        val setting = com.checkinassistant.map.MapSettings.setting(this)
+        val hasGms = com.checkinassistant.location.PlayServices.isInstalled(this)
+        if (!com.checkinassistant.domain.LocationSourceRules.needsDynamic(setting, hasGms)) {
+            monitoringReason.visibility = View.GONE
+            return
+        }
+        val keyConfigured = com.checkinassistant.map.MapSettings.amapKeyConfigured(this)
+        val block = com.checkinassistant.domain.LocationSourceRules.block(
+            setting, hasGms, keyConfigured, com.checkinassistant.map.MapSettings.privacy(this)
+        )
+        val text = com.checkinassistant.domain.LocationSourceRules.blockText(block, hasGms, keyConfigured)
+        monitoringReason.text = text.orEmpty()
+        monitoringReason.visibility = if (text == null) View.GONE else View.VISIBLE
+        if (block == com.checkinassistant.domain.LocationBlock.AMAP_PRIVACY_NEEDED) {
+            monitoringReason.setOnClickListener { askAmapPrivacy() }
+        } else {
+            monitoringReason.setOnClickListener(null)
+            monitoringReason.isClickable = false
+        }
+    }
+
+    private fun askAmapPrivacy() {
+        com.checkinassistant.map.AmapPrivacyPrompt.ask(
+            this,
+            onAgree = { refreshMonitoringReason() },
+            onDecline = { refreshMonitoringReason() },
+            onCancel = { refreshMonitoringReason() }
+        )
     }
     private fun rounded(color: Int, radius: Int) = GradientDrawable().apply { cornerRadius = radius.toFloat(); setColor(color) }
     private fun swatchDrawable(color: Int, selected: Boolean) = GradientDrawable().apply {
@@ -525,7 +590,7 @@ class MainActivity : AppCompatActivity() {
             selectedLatitude = point?.latitude ?: selectedLatitude
             selectedLongitude = point?.longitude ?: selectedLongitude
             pendingName = point?.name.orEmpty()
-            pendingRadius = (point?.radiusMeters ?: 200).toString()
+            pendingRadius = (point?.radiusMeters ?: PointDefaults.RADIUS_M).toString()
             pendingActiveStartMinute = point?.activeStartMinute
             pendingActiveEndMinute = point?.activeEndMinute
             pendingDailyTriggerLimit = point?.dailyTriggerLimit
@@ -571,7 +636,7 @@ class MainActivity : AppCompatActivity() {
         }
         startTime.setOnClickListener { pickTime(true) }; endTime.setOnClickListener { pickTime(false) }
         timeWindowEnabled.setOnCheckedChangeListener { _, checked ->
-            if (checked && (pendingActiveStartMinute == null || pendingActiveEndMinute == null)) { pendingActiveStartMinute = 7 * 60; pendingActiveEndMinute = 9 * 60 }
+            if (checked && (pendingActiveStartMinute == null || pendingActiveEndMinute == null)) { pendingActiveStartMinute = PointDefaults.TIME_WINDOW_START_MINUTE; pendingActiveEndMinute = PointDefaults.TIME_WINDOW_END_MINUTE }
             updateTimeButtons()
         }
         val dailyLimitEnabled = CheckBox(this).apply { text = "限制每日最多提醒次数（可选）"; isChecked = pendingDailyTriggerLimit != null; setPadding(0, dp(4), 0, 0); minimumHeight = 0 }
@@ -665,10 +730,15 @@ class MainActivity : AppCompatActivity() {
                 pendingRadius = radius.text.toString()
                 pendingColor = selectedColor
                 editorDialog.dismiss()
-                mapPicker.launch(
-                    Intent(this@MainActivity, MapPickerActivity::class.java)
-                        .putExtra(MapPickerActivity.EXTRA_RADIUS, radius.text.toString().toIntOrNull() ?: 200)
-                )
+                val pickerIntent = Intent(this@MainActivity, MapPickerActivity::class.java)
+                    .putExtra(MapPickerActivity.EXTRA_RADIUS, radius.text.toString().toIntOrNull() ?: PointDefaults.RADIUS_M)
+                // 问题 3：编辑已有提醒点时把当前坐标带过去，地图从这个点开始；新建时不带，保持原样
+                if (point != null) {
+                    pickerIntent
+                        .putExtra(MapPickerActivity.EXTRA_LATITUDE, selectedLatitude)
+                        .putExtra(MapPickerActivity.EXTRA_LONGITUDE, selectedLongitude)
+                }
+                mapPicker.launch(pickerIntent)
             }
         }
         // v4 §4.3: grouped card form — white rounded cards with grey section labels.
@@ -702,12 +772,12 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 0, dp(4), 0)
         }
         val radiusSlider = android.widget.SeekBar(this).apply {
-            max = 5000 - 100
+            max = PointDefaults.RADIUS_MAX_M - PointDefaults.RADIUS_MIN_M
             // keep the existing numeric input as the source of truth
             setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(bar: android.widget.SeekBar?, progress: Int, fromUser: Boolean) {
                     if (!fromUser) return
-                    val meters = 100 + progress
+                    val meters = PointDefaults.RADIUS_MIN_M + progress
                     radius.setText(meters.toString())
                     radiusValue.text = "${meters} 米"
                 }
@@ -716,9 +786,9 @@ class MainActivity : AppCompatActivity() {
             })
         }
         fun syncRadiusSlider() {
-            val meters = radius.text.toString().toIntOrNull() ?: 200
-            radiusSlider.progress = (meters.coerceIn(100, 5000)) - 100
-            radiusValue.text = "${meters.coerceIn(100, 5000)} 米"
+            val meters = radius.text.toString().toIntOrNull() ?: PointDefaults.RADIUS_M
+            radiusSlider.progress = (meters.coerceIn(PointDefaults.RADIUS_MIN_M, PointDefaults.RADIUS_MAX_M)) - PointDefaults.RADIUS_MIN_M
+            radiusValue.text = "${meters.coerceIn(PointDefaults.RADIUS_MIN_M, PointDefaults.RADIUS_MAX_M)} 米"
         }
         radius.setOnFocusChangeListener { _, hasFocus -> if (!hasFocus) syncRadiusSlider() }
         syncRadiusSlider()
@@ -801,7 +871,7 @@ class MainActivity : AppCompatActivity() {
                         val dailyLimitValue = if (dailyLimitEnabled.isChecked) dailyLimit.text.toString().toIntOrNull() else null
                         when {
                             pointName.isBlank() -> name.error = "请输入地点名称"
-                            radiusMeters == null || radiusMeters !in 100..5000 -> radius.error = "半径应为 100–5000 米"
+                            radiusMeters == null || radiusMeters !in PointDefaults.RADIUS_MIN_M..PointDefaults.RADIUS_MAX_M -> radius.error = "半径应为 100–5000 米"
                             timeWindowEnabled.isChecked && (startMinute == null || endMinute == null || startMinute == endMinute) -> Toast.makeText(this@MainActivity, "请选择有效的生效时间段", Toast.LENGTH_SHORT).show()
                             dailyLimitEnabled.isChecked && (dailyLimitValue == null || dailyLimitValue < 1) -> dailyLimit.error = "次数应至少为 1"
                             pendingRepeatMode == "WEEKLY" && pendingActiveDays == 0 -> Toast.makeText(this@MainActivity, "按星期重复至少选择一天", Toast.LENGTH_SHORT).show()
@@ -809,10 +879,10 @@ class MainActivity : AppCompatActivity() {
                             else -> {
                                 // Spec §4.9: reset dedup/ONCE state when the relevant inputs change.
                                 val updated = point
-                                    ?.let { com.checkinassistant.reminder.PointRules.resetWindowDedup(it) }
+                                    ?.let { com.checkinassistant.domain.PointRules.resetWindowDedup(it) }
                                     ?.let {
                                         if (pendingRepeatMode == "ONCE" && pendingOnceDate != it.onceDate) {
-                                            com.checkinassistant.reminder.PointRules.rearmOnce(it)
+                                            com.checkinassistant.domain.PointRules.rearmOnce(it)
                                         } else it
                                     }
                                 val onceStatus = when {
@@ -863,59 +933,29 @@ class MainActivity : AppCompatActivity() {
         editorDialog.show()
     }
 
-    /** A disabled point must stop immediately: drop its reminders, then re-register geofences. */
-    /** §4.7 / §6.2: skip today for WEEKLY / DAILY / ONCE; writes a PointSkipEvent for stats. */
+    // 下面四个操作的后台部分在 PointActions 里；这里只负责在页面的协程里调用它，做完弹提示。
     private fun skipPointToday(point: CheckInPoint) = lifecycleScope.launch {
-        val today = java.time.LocalDate.now()
-        val updated = com.checkinassistant.reminder.PointRules.onSkipToday(point, today)
-        dao.update(updated)
-        AppDatabase.get(this@MainActivity).pointSkipEventDao().insert(
-            PointSkipEvent(reminderPointId = point.id, skipDate = today.toString(), createdAt = System.currentTimeMillis())
-        )
-        ReminderEngine.cancel(this@MainActivity, point.id)
-        ReminderEngine.dismissNotifications(this@MainActivity, point.id)
-        AppDatabase.get(this@MainActivity).reminderDao().deactivate(point.id)
-        GeofenceMonitoringService.start(this@MainActivity)
-        DiagnosticRecordLogger.geofence(this@MainActivity, "POINT_SKIP：#${point.id} ${point.name} 跳过 ${today}，已写入跳过事件")
+        PointActions.skipToday(this@MainActivity, point)
         Toast.makeText(this@MainActivity, "已跳过今天：${point.name}", Toast.LENGTH_SHORT).show()
     }
 
-    /** §4.9c: restore a finished/skipped/expired ONCE point — date unchanged, status back to PENDING. */
-    /** v5+: user acknowledges an unacknowledged ONCE arrival — latest IGNORED record → COMPLETED. */
     private fun acknowledgePoint(point: CheckInPoint) = lifecycleScope.launch {
-        val recordDao = AppDatabase.get(this@MainActivity).recordDao()
-        recordDao.latestForPoint(point.id)?.let { record ->
-            if (record.status == RecordStatus.IGNORED.name) {
-                recordDao.update(record.copy(status = RecordStatus.COMPLETED.name, actionAt = System.currentTimeMillis()))
-            }
-        }
-        // Badge flips to "已完成" via the records flow; the point itself stays as-is.
-        DiagnosticRecordLogger.geofence(this@MainActivity, "POINT_ACKNOWLEDGE：#${point.id} ${point.name} 已到达未确认 → 已完成")
+        PointActions.acknowledge(this@MainActivity, point)
         Toast.makeText(this@MainActivity, "已确认：${point.name}", Toast.LENGTH_SHORT).show()
     }
 
     private fun restorePoint(point: CheckInPoint) = lifecycleScope.launch {
-        val updated = com.checkinassistant.reminder.PointRules.rearmOnce(point)
-        dao.update(updated)
-        GeofenceMonitoringService.start(this@MainActivity)
-        DiagnosticRecordLogger.geofence(this@MainActivity, "POINT_RESTORE：#${point.id} ${point.name} onceStatus=${point.onceStatus}→PENDING，日期保持 ${point.onceDate}")
-        Toast.makeText(this@MainActivity, "已恢复：${point.name}", Toast.LENGTH_SHORT).show()
+        PointActions.restore(this@MainActivity, point)
+        // 日期已过的一次性点恢复后不会提醒，提示用户去改日期（字多，显示久一点）
+        if (PointRules.isOnceDatePast(point, java.time.LocalDate.now())) {
+            Toast.makeText(this@MainActivity, "已恢复：${point.name}（日期已过，请到编辑页改日期）", Toast.LENGTH_LONG).show()
+        } else {
+            Toast.makeText(this@MainActivity, "已恢复：${point.name}", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun togglePoint(point: CheckInPoint, enabled: Boolean) = lifecycleScope.launch {
-        // v4 §1.3 改动点4: re-enabling a COMPLETED once-point re-arms it (date unchanged).
-        if (enabled && point.repeatMode == "ONCE" && point.onceStatus == "COMPLETED") {
-            dao.update(com.checkinassistant.reminder.PointRules.rearmOnce(point).copy(enabled = true))
-        } else {
-            dao.setEnabledAndRearm(point.id, enabled)
-        }
-        AppDatabase.get(this@MainActivity).pointEnabledEventDao()
-            .insert(PointEnabledEvent(pointId = point.id, atMillis = System.currentTimeMillis(), enabled = enabled))
-        ReminderEngine.cancel(this@MainActivity, point.id)
-        ReminderEngine.dismissNotifications(this@MainActivity, point.id)
-        AppDatabase.get(this@MainActivity).reminderDao().deactivate(point.id)
-        GeofenceMonitoringService.start(this@MainActivity)
-        DiagnosticRecordLogger.geofence(this@MainActivity, "POINT_TOGGLE：#${point.id} ${point.name} enabled=$enabled，已取消提醒并重新注册围栏")
+        PointActions.toggle(this@MainActivity, point, enabled)
         Toast.makeText(this@MainActivity, if (enabled) "已启用：${point.name}" else "已禁用：${point.name}", Toast.LENGTH_SHORT).show()
     }
 
@@ -923,28 +963,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun confirmDelete(point: CheckInPoint) {
         AlertDialog.Builder(this).setTitle("删除提醒点？").setMessage("将删除“${point.name}”。")
-            .setNegativeButton("取消", null).setPositiveButton("删除") { _, _ -> lifecycleScope.launch { dao.delete(point); GeofenceMonitoringService.start(this@MainActivity) } }.show()
-    }
-
-    private fun chooseSimulationPoint() {
-        lifecycleScope.launch {
-            val points = dao.enabledPoints()
-            if (points.isEmpty()) { Toast.makeText(this@MainActivity, "请先添加并保存一个提醒点", Toast.LENGTH_SHORT).show(); return@launch }
-            AlertDialog.Builder(this@MainActivity).setTitle("选择要模拟的提醒点")
-                .setItems(points.map { it.name }.toTypedArray()) { _, index ->
-                    lifecycleScope.launch { ReminderEngine.simulate(this@MainActivity, points[index].id) }
-                }.show()
-        }
-    }
-
-    private fun chooseRingtone() {
-        val preferences = getSharedPreferences("reminder_settings", MODE_PRIVATE)
-        val current = preferences.getString("ringtone_uri", null)?.let(Uri::parse)
-            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-        ringtonePicker.launch(Intent(RingtoneManager.ACTION_RINGTONE_PICKER).apply {
-            putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_RINGTONE)
-            putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, false)
-            putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, current)
-        })
+            .setNegativeButton("取消", null).setPositiveButton("删除") { _, _ -> lifecycleScope.launch { PointActions.delete(this@MainActivity, point) } }.show()
     }
 }

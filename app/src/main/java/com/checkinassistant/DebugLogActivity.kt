@@ -1,5 +1,6 @@
 package com.checkinassistant
 
+import com.checkinassistant.ui.Ui
 import android.app.AlertDialog
 import android.content.Intent
 import android.graphics.Color
@@ -30,7 +31,8 @@ import java.util.Locale
 /** Technical records deliberately kept separate from the daily check-in calendar. */
 class DebugLogActivity : AppCompatActivity() {
     private val dao by lazy { AppDatabase.get(this).recordDao() }
-    private lateinit var retentionButton: Button
+    /** v2.2.27：顶部说明文字，末尾「保留 N 天（点击修改）」可点。 */
+    private lateinit var headerText: TextView
     private lateinit var logContainer: LinearLayout
     /** 最近一次渲染的记录，供「复制全部」使用（不改动任何日志读写逻辑）。 */
     private var lastRecords: List<CheckInRecord> = emptyList()
@@ -51,13 +53,19 @@ class DebugLogActivity : AppCompatActivity() {
             setPadding(dp(16), dp(16), dp(16), dp(16))
             setBackgroundColor(Ui.ROW_BG)
         }
-        root.addView(TextView(this).apply {
-            text = "围栏与后台监测的技术记录，仅用于排查问题。"
+        headerText = TextView(this).apply {
             textSize = 14f; setTextColor(Ui.TEXT_SUB); setPadding(0, 0, 0, dp(10))
-        })
+            // 让文字里的可点击部分能点
+            movementMethod = android.text.method.LinkMovementMethod.getInstance()
+            highlightColor = Color.TRANSPARENT
+        }
+        root.addView(headerText)
         val actions = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        retentionButton = Button(this).apply { setOnClickListener { editRetention() } }
-        actions.addView(retentionButton, LinearLayout.LayoutParams(0, dp(46), 1f).apply { setMargins(0, 0, dp(4), 0) })
+        // v2.2.27：原来「保留 N 天」按钮的位置换成「清空调试日志」（从设置页移过来）；保留天数改到上面的说明文字里
+        actions.addView(
+            Button(this).apply { text = "清空调试日志"; maxLines = 1; setPadding(dp(4), 0, dp(4), 0); setOnClickListener { confirmClearLogs() } },
+            LinearLayout.LayoutParams(0, dp(46), 1f).apply { setMargins(0, 0, dp(4), 0) }
+        )
         actions.addView(Button(this).apply { text = "导出日志"; setOnClickListener { exportLogs() } }, LinearLayout.LayoutParams(0, dp(46), 1f).apply { setMargins(dp(4), 0, dp(4), 0) })
         actions.addView(Button(this).apply { text = "复制全部"; setOnClickListener { copyAllLogs() } }, LinearLayout.LayoutParams(0, dp(46), 1f))
         root.addView(actions)
@@ -132,8 +140,35 @@ class DebugLogActivity : AppCompatActivity() {
             }.show()
     }
 
+    /** v2.2.27：「……仅用于排查问题。保留 N 天（点击修改）」，后半句可点，点了弹保留天数对话框（对话框本身没变）。 */
     private fun updateRetentionLabel() {
-        retentionButton.text = "保留 ${DiagnosticRecordLogger.retentionDays(this)} 天"
+        val intro = "围栏与后台监测的技术记录，仅用于排查问题。"
+        val link = "保留 ${DiagnosticRecordLogger.retentionDays(this)} 天（点击修改）"
+        headerText.text = android.text.SpannableString(intro + link).apply {
+            setSpan(object : android.text.style.ClickableSpan() {
+                override fun onClick(widget: View) = editRetention()
+                override fun updateDrawState(ds: android.text.TextPaint) {
+                    ds.color = Ui.PRIMARY
+                    ds.isUnderlineText = true
+                }
+            }, intro.length, intro.length + link.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+    }
+
+    /** v2.2.27：从设置页「数据管理」移过来，确认框和提示文字照旧。清空后列表由上面的数据监听自动刷新。 */
+    private fun confirmClearLogs() {
+        AlertDialog.Builder(this)
+            .setTitle("清空调试日志")
+            .setMessage("将删除全部诊断记录，且不可恢复。确定继续？")
+            .setPositiveButton("清空") { _, _ ->
+                lifecycleScope.launch {
+                    // Debug 状态的记录即调试日志（pointId=0 的诊断条目）
+                    dao.deleteByStatusBefore(RecordStatus.DEBUG.name, Long.MAX_VALUE)
+                    Toast.makeText(this@DebugLogActivity, "调试日志已清空", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     private fun exportLogs() {

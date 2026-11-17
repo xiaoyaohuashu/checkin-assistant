@@ -1,49 +1,15 @@
 package com.checkinassistant.data
 
 import android.content.Context
-import org.json.JSONArray
-import org.json.JSONObject
 
 /**
- * v6: full data export (points / records / day notes) as one
- * JSON document. Pure read — never mutates the database.
+ * 完整数据导出（v2.2.25 起：全部字段 + 跳过/启停记录 + 提醒状态 + 设置，格式见 [BackupCodec]）。
+ * 只读，不改数据库。调试日志不导出（在「调试日志」页单独导出）。
  */
 object BackupExporter {
 
     suspend fun exportAll(context: Context): String {
-        val db = AppDatabase.get(context.applicationContext)
-        val out = JSONObject()
-        out.put("app", "checkin-assistant")
-        out.put("schema", db.hashCode()) // informational only
-        out.put("exportedAt", System.currentTimeMillis())
-
-        out.put("points", JSONArray().apply {
-            db.checkInPointDao().getAllOnce().forEach { p ->
-                put(JSONObject().apply {
-                    put("id", p.id); put("name", p.name)
-                    put("latitude", p.latitude); put("longitude", p.longitude)
-                    put("radiusMeters", p.radiusMeters)
-                    put("repeatMode", p.repeatMode); put("onceStatus", p.onceStatus)
-                    put("activeDays", p.activeDays)
-                    put("activeStartMinute", p.activeStartMinute)
-                    put("activeEndMinute", p.activeEndMinute)
-                    put("enabled", p.enabled)
-                })
-            }
-        })
-        out.put("records", JSONArray().apply {
-            db.recordDao().getAllOnce().forEach { r ->
-                put(JSONObject().apply {
-                    put("pointId", r.pointId); put("pointName", r.pointName)
-                    put("triggeredAt", r.triggeredAt); put("status", r.status)
-                })
-            }
-        })
-        out.put("dayNotes", JSONArray().apply {
-            db.dayNoteDao().getAllOnce().forEach { n ->
-                put(JSONObject().apply { put("date", n.date); put("note", n.note) })
-            }
-        })
-        return out.toString(2)
+        val store = AndroidBackupStore(context.applicationContext)
+        return BackupCodec.encode(store.readSnapshot(), store.exportMeta())
     }
 }

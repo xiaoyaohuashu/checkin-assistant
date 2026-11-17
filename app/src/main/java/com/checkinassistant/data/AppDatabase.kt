@@ -15,6 +15,8 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun pointEnabledEventDao(): PointEnabledEventDao
     abstract fun pointSkipEventDao(): PointSkipEventDao
     abstract fun dayNoteDao(): DayNoteDao
+    /** v2.2.25：备份导出/导入专用。只加了 DAO，数据库结构和版本号都没变。 */
+    abstract fun backupDao(): BackupDao
 
     companion object {
         @Volatile private var instance: AppDatabase? = null

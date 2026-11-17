@@ -26,4 +26,18 @@
         <item name="android:windowMinWidthMinor">100%</item>
         <item name="android:windowBackground">@android:color/transparent</item>
     </style>
+
+    <!-- v2.2.28：到达提醒全屏页专用主题。深色、无标题栏，状态栏/导航栏透明，内容延伸到刘海区域；
+         运行时再隐藏系统栏（FullscreenReminderActivity.hideSystemBars）。 -->
+    <style name="Theme.CheckInAssistant.Reminder" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowBackground">@drawable/bg_reminder_fullscreen</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
 </resources>

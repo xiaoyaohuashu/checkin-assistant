@@ -34,6 +34,14 @@
         <meta-data
             android:name="com.google.android.geo.API_KEY"
             android:value="${GOOGLE_MAPS_API_KEY}" />
+        <!-- v2.2.25 高德：Key 来自 local.properties 的 AMAP_API_KEY（可为空）；定位服务不放独立进程。
+             高德旧文档要求的 org.apache.http.legacy（required=false）谷歌地图库已经声明过，这里不重复写。 -->
+        <meta-data
+            android:name="com.amap.api.v2.apikey"
+            android:value="${AMAP_API_KEY}" />
+        <service
+            android:name="com.amap.api.location.APSService"
+            android:exported="false" />
         <activity
             android:name=".MapPickerActivity"
             android:exported="false" />
@@ -45,6 +53,7 @@
             android:excludeFromRecents="true"
             android:taskAffinity="com.checkinassistant.fullscreen"
             android:showOnLockScreen="true"
+            android:theme="@style/Theme.CheckInAssistant.Reminder"
             android:launchMode="singleTop" />
         <provider
             android:name="androidx.core.content.FileProvider"

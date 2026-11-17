@@ -1,5 +1,8 @@
 package com.checkinassistant
 
+import com.checkinassistant.ui.Ui
+import com.checkinassistant.ui.tight
+import com.checkinassistant.ui.leading
 import android.app.AlertDialog
 import android.app.DatePickerDialog
 import android.graphics.Color
@@ -20,6 +23,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
+import com.checkinassistant.domain.HistoryStats
 import com.checkinassistant.data.AppDatabase
 import com.checkinassistant.data.CheckInPoint
 import com.checkinassistant.data.CheckInRecord
@@ -70,8 +74,6 @@ class HistoryFragment : Fragment() {
     /** v7: 当前选中的日期（对应原型 selected），驱动日历上的日期高亮。 */
     private var selectedDay: Int = Calendar.getInstance().get(Calendar.DAY_OF_MONTH)
 
-    /** v7: 最新一次统计快照，供点击日期时重算当日记录。 */
-    private var lastStats: List<PointStat> = emptyList()
 
     /** 日历单元格边长（7 列 + 6 个 6dp 间隙，与原型 grid-cols-7 gap-1.5 等宽等高）。 */
     private var cellWidth = 0
@@ -377,59 +379,27 @@ class HistoryFragment : Fragment() {
         val skips: List<PointSkipEvent>
     )
 
-    /** Days this point was explicitly skipped via "今天跳过" (skip events carry the local date). */
-    private suspend fun skippedDaysInMonth(
+    /**
+     * 一个提醒点这个月的统计（v2.2.24，问题 7：只算本该提醒的日子）。算法在 HistoryStats.monthStat，
+     * 这里只负责查「月初之前最后一次开关的状态」。
+     */
+    private suspend fun monthStatOf(
         point: CheckInPoint,
+        records: List<CheckInRecord>,
+        events: List<PointEnabledEvent>,
         skips: List<PointSkipEvent>,
         monthStart: Calendar,
         countedDays: Int
-    ): Int {
-        if (countedDays <= 0) return 0
-        val month = "%04d-%02d".format(monthStart.get(Calendar.YEAR), monthStart.get(Calendar.MONTH) + 1)
-        return skips.asSequence()
-            .filter { it.reminderPointId == point.id && it.skipDate.startsWith(month) }
-            .map { it.skipDate }
-            .distinct()
-            .count()
-    }
-
-    /** Days whose start found the point disabled; toggles inside a day apply from that moment on. */
-    private suspend fun disabledDaysInMonth(
-        point: CheckInPoint,
-        events: List<PointEnabledEvent>,
-        monthStart: Calendar,
-        countedDays: Int
-    ): Int {
-        if (countedDays <= 0) return 0
-        val monthStartMillis = monthStart.timeInMillis
+    ): HistoryStats.MonthStat {
         // No recorded change means the point was never toggled, i.e. always enabled.
-        var enabled = eventDao.latestBefore(point.id, monthStartMillis)?.enabled ?: true
-        val changes = events.filter { it.pointId == point.id }.sortedBy { it.atMillis }
-        var nextChange = 0
-        var disabledDays = 0
-        for (day in 1..countedDays) {
-            val dayStart = (monthStart.clone() as Calendar).apply { set(Calendar.DAY_OF_MONTH, day) }.timeInMillis
-            while (nextChange < changes.size && changes[nextChange].atMillis < dayStart) {
-                enabled = changes[nextChange].enabled
-                nextChange++
-            }
-            if (!enabled) disabledDays++
-        }
-        return disabledDays
+        val enabled = eventDao.latestBefore(point.id, monthStart.timeInMillis)?.enabled ?: true
+        return HistoryStats.monthStat(point, enabled, records, events, skips, monthStart, countedDays)
     }
 
     /** Current months count through today; completed past months count every calendar day. */
     private fun countedDaysInMonth(monthStart: Calendar): Int {
         val now = Calendar.getInstance()
-        val monthComparison = compareValues(
-            monthStart.get(Calendar.YEAR) * 12 + monthStart.get(Calendar.MONTH),
-            now.get(Calendar.YEAR) * 12 + now.get(Calendar.MONTH)
-        )
-        return when {
-            monthComparison < 0 -> monthStart.getActualMaximum(Calendar.DAY_OF_MONTH)
-            monthComparison == 0 -> now.get(Calendar.DAY_OF_MONTH)
-            else -> 0
-        }
+        return HistoryStats.countedDaysInMonth(monthStart, now)
     }
 
     // ── 渲染 ─────────────────────────────────────────────────
@@ -567,21 +537,14 @@ class HistoryFragment : Fragment() {
                 disabledCount++
                 return@forEach
             }
-            val arrived = records.asSequence()
-                .filter { it.pointId == point.id && it.day <= counted }
-                .map { it.day }
-                .distinct()
-                .count()
-            val expected = (counted - disabledDaysInMonth(point, events, monthStart, counted) -
-                skippedDaysInMonth(point, skips, monthStart, counted)).coerceAtLeast(0)
+            val stat = monthStatOf(point, records, events, skips, monthStart, counted)
             stats.add(
                 PointStat(
                     point.name, PointColors.forPoint(point),
-                    arrived, (expected - arrived).coerceAtLeast(0), disabled = false
+                    stat.arrivedDays, stat.missedDays, disabled = false
                 )
             )
         }
-        lastStats = stats
 
         statsContainer.removeAllViews()
         if (stats.isEmpty()) {
@@ -640,7 +603,7 @@ class HistoryFragment : Fragment() {
         disabledRow.addView(Ui.pill(context, "已禁用", Ui.CHIP_BG, Ui.CHIP_FG))
         statsContainer.addView(disabledRow, LinearLayout.LayoutParams(-1, -2))
 
-        renderNotes(points, events, skips, monthStart, counted)
+        renderNotes(points, records, events, skips, monthStart, counted)
     }
 
     /**
@@ -649,6 +612,7 @@ class HistoryFragment : Fragment() {
      */
     private suspend fun renderNotes(
         points: List<CheckInPoint>,
+        records: List<CheckInRecord>,
         events: List<PointEnabledEvent>,
         skips: List<PointSkipEvent>,
         monthStart: Calendar,
@@ -663,8 +627,9 @@ class HistoryFragment : Fragment() {
         val lines = mutableListOf<String>()
         points.sortedBy { it.id }.forEach { point ->
             if (!point.enabled) return@forEach
-            val disabledDays = disabledDaysInMonth(point, events, monthStart, counted)
-            val skippedDays = skippedDaysInMonth(point, skips, monthStart, counted)
+            val stat = monthStatOf(point, records, events, skips, monthStart, counted)
+            val disabledDays = stat.disabledDays
+            val skippedDays = stat.skippedDays
             val notes = buildList {
                 if (disabledDays > 0) add("已禁用 $disabledDays 天")
                 if (skippedDays > 0) add("已跳过 $skippedDays 天")

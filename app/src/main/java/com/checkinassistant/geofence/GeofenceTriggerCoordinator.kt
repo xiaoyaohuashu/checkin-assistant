@@ -4,6 +4,7 @@ import android.content.Context
 import com.checkinassistant.data.AppDatabase
 import com.checkinassistant.data.DiagnosticRecordLogger
 import com.checkinassistant.data.PointState
+import com.checkinassistant.domain.isActiveAtMillis
 import com.checkinassistant.reminder.ReminderEngine
 
 /** Makes passive geofence and active-polling transitions share one atomic entry path. */
@@ -19,6 +20,11 @@ object GeofenceTriggerCoordinator {
             DiagnosticRecordLogger.geofence(context, "$source：#${point.id} ${point.name} 已禁用，忽略进入")
             return
         }
+        // v2.2.24（问题 1）：用户手动停止后，漏网的围栏回调不再触发提醒流程。
+        if (MonitorKeeper.userStopped(context)) {
+            DiagnosticRecordLogger.geofence(context, "$source：#${point.id} ${point.name} 用户已手动停止监测，忽略进入")
+            return
+        }
         if (!point.isActiveAtMillis(System.currentTimeMillis())) {
             DiagnosticRecordLogger.geofence(context, "$source：#${point.id} ${point.name} 不在生效时间段，忽略进入")
             return
@@ -26,7 +32,7 @@ object GeofenceTriggerCoordinator {
         // Spec §4.5: day-level eligibility (weekday/skip/repeat-mode) + window dedup
         // live in PointRules.isActiveNow — the single filtering implementation.
         val now = System.currentTimeMillis()
-        if (!com.checkinassistant.reminder.PointRules.isActiveNow(point, now)) {
+        if (!com.checkinassistant.domain.PointRules.isActiveNow(point, now)) {
             DiagnosticRecordLogger.geofence(context, "$source：#${point.id} ${point.name} 今日不生效或窗口已提醒过，忽略进入")
             return
         }

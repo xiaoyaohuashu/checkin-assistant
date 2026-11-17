@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- v2.2.28：到达提醒全屏页 -->
+    <string name="reminder_clock_format" translatable="false">HH:mm</string>
+    <string name="reminder_date_format" translatable="false">M月d日 EEEE</string>
+    <string name="reminder_title">到达%1$s</string>
+    <string name="reminder_default_point">提醒点</string>
+    <string name="reminder_subtitle">请确认 · 提醒 %1$d/%2$d</string>
+    <string name="reminder_snooze">稍后提醒</string>
+    <string name="reminder_arrive">我已到达</string>
+</resources>
