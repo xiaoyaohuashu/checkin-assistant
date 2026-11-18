@@ -39,8 +39,8 @@ android {
         applicationId = "com.checkinassistant"
         minSdk = 29
         targetSdk = 34
-        versionCode = 51
-        versionName = "2.2.28"
+        versionCode = 52
+        versionName = "2.2.29"
         // v2.2.27：原生库（高德地图带来的）只保留 64 位 ARM。近几年的手机都是这种；
         // 只支持 32 位的旧手机和电脑上的 x86 模拟器装不了这个包。
         ndk { abiFilters += listOf("arm64-v8a") }
